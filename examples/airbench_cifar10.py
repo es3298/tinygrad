@@ -128,7 +128,7 @@ def main() -> None:
   parser.add_argument("--batch-size", type=int, default=getenv("BS", 2000))
   parser.add_argument("--steps", type=int, default=getenv("STEPS", 200))
   parser.add_argument("--whiten-bias-steps", type=int, default=getenv("WHITEN_BIAS_STEPS", 75))
-  parser.add_argument("--eval-batch-size", type=int, default=getenv("EVAL_BS", 10000))
+  parser.add_argument("--eval-batch-size", type=int, default=getenv("EVAL_BS", 2000))
   parser.add_argument("--tta-level", type=int, choices=(0, 1, 2), default=getenv("TTA_LEVEL", 2))
   parser.add_argument("--seed", type=int, default=getenv("SEED", 1337))
   parser.add_argument("--target-acc", type=float, default=getenv("TARGET_EVAL_ACC_PCT", 94.0))
@@ -157,16 +157,13 @@ def main() -> None:
       print(f"phase={name} seconds={now-phase_start:.4f}", flush=True)
       phase_start = now
 
+  total_start = time.perf_counter()
   Tensor.manual_seed(args.seed)
   dtypes.default_float = dtypes.half
   model = AirbenchCifarNet(args.bn_eps, args.logit_div)
   phase("model_init")
   X_train_pad, X_train_pad_flip, X_train_norm, X_test, Y_train, Y_test = preprocess_cifar()
   phase("data_preprocess")
-  Device[Device.DEFAULT].synchronize()
-  t0 = time.perf_counter()
-  init_whitening_(model, X_train_norm)
-  phase("whitening_init")
 
   state = nn.state.get_state_dict(model)
   hidden_convs = [v for k,v in state.items() if v.is_param and v.ndim == 4 and not k.startswith("whiten.")]
@@ -184,6 +181,11 @@ def main() -> None:
   opt_head = nn.optim.SGD(head, lr=args.head_lr, momentum=0.85, nesterov=True, weight_decay=wd/args.head_lr if args.head_lr else 0.0, fused=False)
   opt_muon = AirbenchMuon(hidden_convs, lr=args.muon_lr, momentum=0.6, nesterov=True, ns_steps=3, use_bf16=not args.muon_fp16)
   phase("optim_init")
+
+  Device[Device.DEFAULT].synchronize()
+  t0 = time.perf_counter()
+  init_whitening_(model, X_train_norm)
+  phase("whitening_init")
 
   def set_lrs(step:int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     whiten_lr = args.bias_lr * max(0.0, 1.0 - step / args.whiten_bias_steps)
@@ -220,7 +222,7 @@ def main() -> None:
   @Context(TRAINING=1)
   def train_step(Xsrc:Tensor, idxs:Tensor, lr_norm:Tensor, lr_head:Tensor, lr_muon:Tensor) -> Tensor:
     X, Y = random_crop(Xsrc[idxs]), Y_train[idxs]
-    zero_grads(opt_norm, opt_head, opt_muon)
+    zero_grads(opt_whiten, opt_norm, opt_head, opt_muon)
     loss = cross_entropy_sum(model(X, whiten_bias_grad=False), Y) * loss_mult
     loss.backward()
     return loss.realize(*sgd_realize_no_whiten(lr_norm, lr_head), *muon_realize(lr_muon), *bn_buffers)
@@ -249,14 +251,28 @@ def main() -> None:
   def eval_step_tta2(X:Tensor, Y:Tensor) -> Tensor:
     return (infer_tta2(X).argmax(axis=1) == Y).sum().realize()
 
+  @Context(TRAINING=0)
+  def eval_step_basic_raw(X:Tensor, Y:Tensor) -> Tensor:
+    return (model(X, whiten_bias_grad=False).argmax(axis=1) == Y).sum().realize()
+
+  @Context(TRAINING=0)
+  def eval_step_mirror_raw(X:Tensor, Y:Tensor) -> Tensor:
+    return (infer_mirror(X).argmax(axis=1) == Y).sum().realize()
+
+  @Context(TRAINING=0)
+  def eval_step_tta2_raw(X:Tensor, Y:Tensor) -> Tensor:
+    return (infer_tta2(X).argmax(axis=1) == Y).sum().realize()
+
   def evaluate() -> Tensor:
-    eval_fn = (eval_step_basic, eval_step_mirror, eval_step_tta2)[args.tta_level]
-    correct = []
+    eval_fns = (eval_step_basic, eval_step_mirror, eval_step_tta2) if args.eval_batch_size >= X_test.shape[0] else \
+               (eval_step_basic_raw, eval_step_mirror_raw, eval_step_tta2_raw)
+    eval_fn = eval_fns[args.tta_level]
+    correct = Tensor.zeros((), dtype=dtypes.int32).realize()
     for i in range(0, X_test.shape[0], args.eval_batch_size):
       X = X_test[i:i+args.eval_batch_size].contiguous().realize()
       Y = Y_test[i:i+args.eval_batch_size].contiguous().realize()
-      correct.append(eval_fn(X, Y))
-    return Tensor.stack(*correct).sum()
+      correct = (correct + eval_fn(X, Y).cast(dtypes.int32)).realize()
+    return correct
 
   Device[Device.DEFAULT].synchronize()
   train_start = time.perf_counter()
@@ -278,7 +294,9 @@ def main() -> None:
   eval_start = time.perf_counter()
   correct = evaluate()
   Device[Device.DEFAULT].synchronize()
-  wall_time = time.perf_counter() - t0
+  end_time = time.perf_counter()
+  wall_time = end_time - t0
+  total_time = end_time - total_start
   if args.profile_phases and not args.quiet:
     print(f"phase=timed_eval seconds={time.perf_counter()-eval_start:.4f}", flush=True)
 
@@ -305,7 +323,7 @@ def main() -> None:
     print(f"runtime DEV={Device.DEFAULT} DEFAULT_FLOAT={dtypes.default_float}")
   print(f"device={Device.DEFAULT} seed={args.seed} steps={steps} batch_size={batch_size} tta_level={args.tta_level}")
   print("timed_region=whitening_train_eval")
-  print(f"accuracy={acc:.2f} correct={correct_count}/{X_test.shape[0]} wall_time_s={wall_time:.4f}")
+  print(f"accuracy={acc:.2f} correct={correct_count}/{X_test.shape[0]} wall_time_s={wall_time:.4f} end_to_end_after_download_s={total_time:.4f}")
   if args.target_acc and acc < args.target_acc: raise SystemExit(f"accuracy {acc:.2f} < target {args.target_acc:.2f}")
   if args.target_time and wall_time > args.target_time: raise SystemExit(f"wall_time {wall_time:.4f} > target {args.target_time:.4f}")
 
