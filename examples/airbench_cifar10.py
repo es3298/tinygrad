@@ -7,7 +7,7 @@ from tinygrad.helpers import Context, getenv, TRAINING
 CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR_STD = (0.2470, 0.2435, 0.2616)
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
-EXACT_GELU = getenv("EXACT_GELU", 0)
+EXACT_GELU = getenv("EXACT_GELU", 1)
 
 def activ(x:Tensor) -> Tensor:
   return x.gelu("none") if EXACT_GELU else x.quick_gelu()
@@ -77,9 +77,12 @@ class AirbenchMuon(nn.optim.Optimizer):
     return updates, self.b
 
 def dirac_init_(conv:nn.Conv2d) -> None:
-  w = np.zeros(conv.weight.shape, dtype=np.float32)
+  # Match Airbench: preserve random expansion channels, Dirac only the first input-width block.
+  w = conv.weight.float().numpy().astype(np.float32)
   oc, ic, kh, kw = w.shape
-  for i in range(min(oc, ic)): w[i, i, kh//2, kw//2] = 1.0
+  n = min(oc, ic)
+  w[:n] = 0.0
+  for i in range(n): w[i, i, kh//2, kw//2] = 1.0
   conv.weight.assign(Tensor(w, dtype=dtypes.float32).cast(conv.weight.dtype))
 
 def pad_reflect(X:Tensor, size=2) -> Tensor:
@@ -126,7 +129,7 @@ def main() -> None:
   parser.add_argument("--steps", type=int, default=getenv("STEPS", 200))
   parser.add_argument("--whiten-bias-steps", type=int, default=getenv("WHITEN_BIAS_STEPS", 75))
   parser.add_argument("--eval-batch-size", type=int, default=getenv("EVAL_BS", 10000))
-  parser.add_argument("--tta-level", type=int, choices=(0, 1, 2), default=getenv("TTA_LEVEL", 1))
+  parser.add_argument("--tta-level", type=int, choices=(0, 1, 2), default=getenv("TTA_LEVEL", 2))
   parser.add_argument("--seed", type=int, default=getenv("SEED", 1337))
   parser.add_argument("--target-acc", type=float, default=getenv("TARGET_EVAL_ACC_PCT", 94.0))
   parser.add_argument("--target-time", type=float, default=getenv("TARGET_TIME_S", 10.0))
@@ -135,9 +138,8 @@ def main() -> None:
   parser.add_argument("--muon-lr", type=float, default=getenv("MUON_LR", 0.24))
   parser.add_argument("--weight-decay", type=float, default=getenv("WEIGHT_DECAY", -1.0))
   parser.add_argument("--loss-mult", type=float, default=getenv("LOSS_MULT", -1.0))
-  parser.add_argument("--bn-eps", type=float, default=getenv("BN_EPS", 1e-3))
+  parser.add_argument("--bn-eps", type=float, default=getenv("BN_EPS", 1e-12))
   parser.add_argument("--logit-div", type=float, default=getenv("LOGIT_DIV", 256.0))
-  parser.add_argument("--eval-batch-stats", action="store_true", default=bool(getenv("EVAL_BATCH_STATS", 0)))
   parser.add_argument("--muon-fp16", action="store_true", default=bool(getenv("MUON_FP16", 0)))
   parser.add_argument("--no-muon", action="store_true", default=bool(getenv("NO_MUON", 0)))
   parser.add_argument("--no-sgd", action="store_true", default=bool(getenv("NO_SGD", 0)))
@@ -161,6 +163,8 @@ def main() -> None:
   phase("model_init")
   X_train_pad, X_train_pad_flip, X_train_norm, X_test, Y_train, Y_test = preprocess_cifar()
   phase("data_preprocess")
+  Device[Device.DEFAULT].synchronize()
+  t0 = time.perf_counter()
   init_whitening_(model, X_train_norm)
   phase("whitening_init")
 
@@ -172,7 +176,7 @@ def main() -> None:
   bn_buffers = [v for k,v in state.items() if "running_mean" in k or "running_var" in k or "num_batches_tracked" in k]
 
   batch_size, steps = args.batch_size, args.steps
-  loss_mult = (512 / batch_size) if args.loss_mult < 0 else args.loss_mult
+  loss_mult = 1.0 if args.loss_mult < 0 else args.loss_mult
   batches_per_epoch = X_train_norm.shape[0] // batch_size
   wd = 2e-6 * batch_size if args.weight_decay < 0 else args.weight_decay
   opt_whiten = nn.optim.SGD(whiten_bias, lr=args.bias_lr, momentum=0.85, nesterov=True, weight_decay=wd/args.bias_lr if args.bias_lr else 0.0, fused=False)
@@ -245,24 +249,8 @@ def main() -> None:
   def eval_step_tta2(X:Tensor, Y:Tensor) -> Tensor:
     return (infer_tta2(X).argmax(axis=1) == Y).sum().realize()
 
-  @TinyJit
-  @Context(TRAINING=1)
-  def eval_step_basic_batch_stats(X:Tensor, Y:Tensor) -> Tensor:
-    return (model(X, whiten_bias_grad=False).argmax(axis=1) == Y).sum().realize(*bn_buffers)
-
-  @TinyJit
-  @Context(TRAINING=1)
-  def eval_step_mirror_batch_stats(X:Tensor, Y:Tensor) -> Tensor:
-    return (infer_mirror(X).argmax(axis=1) == Y).sum().realize(*bn_buffers)
-
-  @TinyJit
-  @Context(TRAINING=1)
-  def eval_step_tta2_batch_stats(X:Tensor, Y:Tensor) -> Tensor:
-    return (infer_tta2(X).argmax(axis=1) == Y).sum().realize(*bn_buffers)
-
   def evaluate() -> Tensor:
-    eval_fn = ((eval_step_basic_batch_stats, eval_step_mirror_batch_stats, eval_step_tta2_batch_stats) if args.eval_batch_stats else
-               (eval_step_basic, eval_step_mirror, eval_step_tta2))[args.tta_level]
+    eval_fn = (eval_step_basic, eval_step_mirror, eval_step_tta2)[args.tta_level]
     correct = []
     for i in range(0, X_test.shape[0], args.eval_batch_size):
       X = X_test[i:i+args.eval_batch_size].contiguous().realize()
@@ -271,8 +259,7 @@ def main() -> None:
     return Tensor.stack(*correct).sum()
 
   Device[Device.DEFAULT].synchronize()
-  t0 = time.perf_counter()
-  train_start = t0
+  train_start = time.perf_counter()
   step = 0
   for epoch in range(math.ceil(steps / batches_per_epoch)):
     Xsrc = X_train_pad if epoch % 2 == 0 else X_train_pad_flip
@@ -317,6 +304,7 @@ def main() -> None:
     print(f"hardware={gpu_info} tinygrad_commit={commit}")
     print(f"runtime DEV={Device.DEFAULT} DEFAULT_FLOAT={dtypes.default_float}")
   print(f"device={Device.DEFAULT} seed={args.seed} steps={steps} batch_size={batch_size} tta_level={args.tta_level}")
+  print("timed_region=whitening_train_eval")
   print(f"accuracy={acc:.2f} correct={correct_count}/{X_test.shape[0]} wall_time_s={wall_time:.4f}")
   if args.target_acc and acc < args.target_acc: raise SystemExit(f"accuracy {acc:.2f} < target {args.target_acc:.2f}")
   if args.target_time and wall_time > args.target_time: raise SystemExit(f"wall_time {wall_time:.4f} > target {args.target_time:.4f}")
