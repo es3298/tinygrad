@@ -236,42 +236,27 @@ def main() -> None:
     logits_translate = (infer_mirror(Xp[:, :, 0:32, 0:32]) + infer_mirror(Xp[:, :, 2:34, 2:34])) * 0.5
     return logits * 0.5 + logits_translate * 0.5
 
-  @TinyJit
   @Context(TRAINING=0)
-  def eval_step_basic(X:Tensor, Y:Tensor) -> Tensor:
-    return (model(X, whiten_bias_grad=False).argmax(axis=1) == Y).sum().realize()
-
-  @TinyJit
-  @Context(TRAINING=0)
-  def eval_step_mirror(X:Tensor, Y:Tensor) -> Tensor:
-    return (infer_mirror(X).argmax(axis=1) == Y).sum().realize()
-
-  @TinyJit
-  @Context(TRAINING=0)
-  def eval_step_tta2(X:Tensor, Y:Tensor) -> Tensor:
-    return (infer_tta2(X).argmax(axis=1) == Y).sum().realize()
-
-  @Context(TRAINING=0)
-  def eval_step_basic_raw(X:Tensor, Y:Tensor) -> Tensor:
+  def eval_step_basic_impl(X:Tensor, Y:Tensor) -> Tensor:
     return (model(X, whiten_bias_grad=False).argmax(axis=1) == Y).sum().realize()
 
   @Context(TRAINING=0)
-  def eval_step_mirror_raw(X:Tensor, Y:Tensor) -> Tensor:
+  def eval_step_mirror_impl(X:Tensor, Y:Tensor) -> Tensor:
     return (infer_mirror(X).argmax(axis=1) == Y).sum().realize()
 
   @Context(TRAINING=0)
-  def eval_step_tta2_raw(X:Tensor, Y:Tensor) -> Tensor:
+  def eval_step_tta2_impl(X:Tensor, Y:Tensor) -> Tensor:
     return (infer_tta2(X).argmax(axis=1) == Y).sum().realize()
 
   def evaluate() -> Tensor:
-    eval_fns = (eval_step_basic, eval_step_mirror, eval_step_tta2) if args.eval_batch_size >= X_test.shape[0] else \
-               (eval_step_basic_raw, eval_step_mirror_raw, eval_step_tta2_raw)
-    eval_fn = eval_fns[args.tta_level]
+    assert X_test.shape[0] % args.eval_batch_size == 0, "eval batch size must divide CIFAR-10 test size"
+    eval_impl = (eval_step_basic_impl, eval_step_mirror_impl, eval_step_tta2_impl)[args.tta_level]
+    eval_fns = [TinyJit(eval_impl) for _ in range(X_test.shape[0] // args.eval_batch_size)]
     correct = Tensor.zeros((), dtype=dtypes.int32).realize()
-    for i in range(0, X_test.shape[0], args.eval_batch_size):
+    for chunk, i in enumerate(range(0, X_test.shape[0], args.eval_batch_size)):
       X = X_test[i:i+args.eval_batch_size].contiguous().realize()
       Y = Y_test[i:i+args.eval_batch_size].contiguous().realize()
-      correct = (correct + eval_fn(X, Y).cast(dtypes.int32)).realize()
+      correct = (correct + eval_fns[chunk](X, Y).cast(dtypes.int32)).realize()
     return correct
 
   Device[Device.DEFAULT].synchronize()
