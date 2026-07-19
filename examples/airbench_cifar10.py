@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Train CIFAR-10 to 94% with the Airbench/Hiverge recipe and report synchronized wall time.
+"""Train CIFAR-10 to 94% with a tinygrad-tuned Airbench/Hiverge recipe.
 
-TinyJit compilation is warmed before the timed region. Whitening initialization, training, and evaluation are timed.
-Recipe references: https://github.com/KellerJordan/cifar10-airbench and https://github.com/hiverge/cifar10-speedrun.
+TinyJit compilation is warmed before the timed region. Whitening, training, evaluation, and accuracy readback are timed.
+The recipe is derived from MIT-licensed Airbench and Hiverge code, then retuned for tinygrad's NV backend on one L40S:
+https://github.com/KellerJordan/cifar10-airbench/tree/4c1b6d1e3889b037efadcfd5c0ea65b246592362
+https://github.com/hiverge/cifar10-speedrun/tree/06c60727547042c847d919c5848e807e8119d582
 
 Run on one NVIDIA GPU with: DEV=NV JITBEAM=4 python3 examples/airbench_cifar10.py
 """
@@ -15,6 +17,11 @@ from tinygrad.uop.ops import KernelInfo
 CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR_STD = (0.2470, 0.2435, 0.2616)
 NS_COEFFS = (3.4576, -4.7391, 2.0843)
+WIDTH, BN_EPS, BN_MOMENTUM, LOGIT_DIV = 256, 1e-12, 0.4434, 256.0
+BIAS_LR, HEAD_LR, MUON_LR = 0.0573, 0.5415, 0.205
+SGD_MOMENTUM, MUON_MOMENTUM, WEIGHT_DECAY = 0.825, 0.655, 1.0418e-6
+LABEL_SMOOTHING, BRIGHTNESS, CONTRAST = 0.09, 0.1399, 0.1308
+TTA_BASE_WEIGHT = 0.2
 
 def whiten_activ(x:Tensor) -> Tensor:
   return x.gelu("none")
@@ -28,19 +35,15 @@ def activation_buffer(x:Tensor) -> Tensor:
 def _conv_weight_grad(x:Tensor, dy:Tensor) -> Tensor:
   n, cin, h, w = x.shape
   cout = dy.shape[1]
-  pooled = x.pad((1, 1, 1, 1))._pool((3, 3))
-  patches = pooled.permute(0, 2, 3, 1, 4, 5).reshape(n * h * w, cin * 9)
+  patches = x.pad((1, 1, 1, 1))._pool((3, 3)).permute(0, 2, 3, 1, 4, 5).reshape(n * h * w, cin * 9)
   dy_matrix = dy.permute(0, 2, 3, 1).reshape(n * h * w, cout).contiguous()
-  grad = dy_matrix.T.matmul(patches)
-  return grad.reshape(cout, cin, 3, 3)
+  return dy_matrix.T.matmul(patches).reshape(cout, cin, 3, 3)
 
 def _conv_input_grad(dy:Tensor, weight:Tensor) -> Tensor:
   n, cout, h, w = dy.shape
   cin = weight.shape[1]
   dy_matrix = dy.permute(0, 2, 3, 1).reshape(n * h * w, cout).contiguous()
-  weight_matrix = weight.reshape(cout, cin * 9)
-  dpatches = dy_matrix.matmul(weight_matrix.contiguous())
-  dpatches = dpatches.reshape(n, h, w, cin, 3, 3)
+  dpatches = dy_matrix.matmul(weight.reshape(cout, cin * 9).contiguous()).reshape(n, h, w, cin, 3, 3)
   parts = []
   for ky in range(3):
     for kx in range(3):
@@ -48,32 +51,30 @@ def _conv_input_grad(dy:Tensor, weight:Tensor) -> Tensor:
       parts.append(part.pad((kx, 2-kx, ky, 2-ky))[:, :, 1:-1, 1:-1])
   return Tensor.stack(*parts).sum(axis=0)
 
-def _conv_dependency(_raw:UOp, _x:UOp, _weight:UOp) -> UOp:
-  return UOp.sink(arg=KernelInfo(name="airbench_conv_dependency"))
+def _conv_gradient_hook(_raw:UOp, _x:UOp, _weight:UOp) -> UOp:
+  # custom_kernel's AFTER edge is tinygrad's supported way to attach a custom gradient
+  # while retaining the scheduler-optimized forward matmul.
+  return UOp.sink(arg=KernelInfo(name="airbench_conv_gradient_hook"))
 
 def airbench_conv2d(x:Tensor, weight:Tensor) -> Tensor:
   """3x3 padded convolution with GEMM-shaped gradients for NVIDIA tensor cores."""
   n, cin, h, w = x.shape
   cout = weight.shape[0]
-  pooled = x.detach().pad((1, 1, 1, 1))._pool((3, 3))
-  patches = pooled.permute(0, 2, 3, 1, 4, 5).reshape(n * h * w, cin * 9)
-  weight_matrix = weight.detach().reshape(cout, cin * 9)
-  raw = patches.contiguous().matmul(weight_matrix.T)
+  patches = x.detach().pad((1, 1, 1, 1))._pool((3, 3)).permute(0, 2, 3, 1, 4, 5).reshape(n * h * w, cin * 9)
+  raw = patches.contiguous().matmul(weight.detach().reshape(cout, cin * 9).T)
   def backward(grad:UOp, call:UOp) -> tuple[None, UOp, UOp]:
     _raw, call_x, call_weight = call.src[1:]
     dy = Tensor(grad).cast(call_x.dtype).reshape(n, h, w, cout).permute(0, 3, 1, 2)
     return None, _conv_input_grad(dy, Tensor(call_weight)).uop, _conv_weight_grad(Tensor(call_x), dy).uop
-  raw = Tensor.custom_kernel(raw, x, weight, fxn=_conv_dependency, grad_fxn=backward)[0]
+  raw = Tensor.custom_kernel(raw, x, weight, fxn=_conv_gradient_hook, grad_fxn=backward)[0]
   return raw.reshape(n, h, w, cout).permute(0, 3, 1, 2)
 
 class AirbenchBatchNorm(nn.BatchNorm2d):
   def __init__(self, channels:int, eps:float, momentum:float):
-    super().__init__(channels, eps=eps, momentum=momentum, affine=True, track_running_stats=True)
-    self.weight = Tensor.ones(channels, dtype=dtypes.float32).is_param_(False)
+    super().__init__(channels, eps=eps, momentum=momentum, affine=False, track_running_stats=True)
     self.bias = Tensor.zeros(channels, dtype=dtypes.float32)
     self.running_mean = Tensor.zeros(channels, dtype=dtypes.float32).is_param_(False)
     self.running_var = Tensor.ones(channels, dtype=dtypes.float32).is_param_(False)
-    self.weight.is_param_(False)
 
 class Conv:
   def __init__(self, channels_in:int, channels_out:int):
@@ -108,7 +109,7 @@ class AirbenchCifarNet:
 
   def __call__(self, x:Tensor, whiten_bias_grad=True) -> Tensor:
     bias = self.whiten.bias if whiten_bias_grad else self.whiten.bias.detach()
-    x = activation_buffer(whiten_activ(x.conv2d(self.whiten.weight, bias)))
+    x = activation_buffer(whiten_activ(x.conv2d(self.whiten.weight.detach(), bias)))
     x = activation_buffer(self.block1(x))
     x = activation_buffer(self.block2(x))
     x = activation_buffer(self.block3(x))
@@ -139,8 +140,7 @@ class AirbenchMuon(nn.optim.Optimizer):
     updates = []
     for p, g in zip(params, momentum_grads):
       base = p.detach()
-      if self.normalize_weights:
-        base = base * ((p.shape[0] ** 0.5) / (base.float().square().sum().sqrt() + 1e-7))
+      if self.normalize_weights: base = base * ((p.shape[0] ** 0.5) / (base.float().square().sum().sqrt() + 1e-7))
       updated = (base - self.lr * g.cast(p.dtype)) * (1.0 - self.lr * self.weight_decay)
       updates.append((p.detach() - updated).cast(p.dtype))
     return updates, self.b
@@ -214,43 +214,30 @@ def preprocess_cifar() -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
 def cross_entropy_sum(logits:Tensor, labels:Tensor, label_smoothing:float) -> Tensor:
   return logits.float().sparse_categorical_crossentropy(labels, reduction="sum", label_smoothing=label_smoothing)
 
+def select_tta_indices(logits:Tensor, count:int) -> Tensor:
+  top_two, _ = logits.topk(2)
+  confidence = top_two[:, 0] - top_two[:, 1]
+  return confidence.topk(count, largest=False)[1]
+
 def main() -> None:
   parser = argparse.ArgumentParser(description="Airbench/Hiverge CIFAR-10 speed benchmark in tinygrad")
   parser.add_argument("--batch-size", type=int, default=getenv("BS", 2000))
   parser.add_argument("--steps", type=int, default=getenv("STEPS", 200))
-  parser.add_argument("--width", type=int, default=getenv("WIDTH", 256))
-  parser.add_argument("--whiten-bias-steps", type=int, default=getenv("WHITEN_BIAS_STEPS", -1))
   parser.add_argument("--eval-batch-size", type=int, default=getenv("EVAL_BS", 2000))
   parser.add_argument("--tta-level", type=int, choices=(0, 1, 2), default=getenv("TTA_LEVEL", 2))
-  parser.add_argument("--tta-base-weight", type=float, default=getenv("TTA_BASE_WEIGHT", 0.2))
   parser.add_argument("--tta-fraction", type=float, default=getenv("TTA_FRACTION", 0.18))
-  parser.add_argument("--tta-score", choices=("margin", "softmax"), default=getenv("TTA_SCORE", "margin"))
   parser.add_argument("--seed", type=int, default=getenv("SEED", 2))
   parser.add_argument("--target-acc", type=float, default=getenv("TARGET_EVAL_ACC_PCT", 94.0))
   parser.add_argument("--target-time", type=float, default=getenv("TARGET_TIME_S", 10.0))
-  parser.add_argument("--bias-lr", type=float, default=getenv("BIAS_LR", 0.0573))
-  parser.add_argument("--head-lr", type=float, default=getenv("HEAD_LR", 0.5415))
-  parser.add_argument("--muon-lr", type=float, default=getenv("MUON_LR", 0.205))
-  parser.add_argument("--sgd-momentum", type=float, default=getenv("SGD_MOMENTUM", 0.825))
-  parser.add_argument("--muon-momentum", type=float, default=getenv("MUON_MOMENTUM", 0.655))
-  parser.add_argument("--weight-decay", type=float, default=getenv("WEIGHT_DECAY", -1.0))
-  parser.add_argument("--loss-mult", type=float, default=getenv("LOSS_MULT", -1.0))
-  parser.add_argument("--label-smoothing", type=float, default=getenv("LABEL_SMOOTHING", 0.09))
-  parser.add_argument("--bn-eps", type=float, default=getenv("BN_EPS", 1e-12))
-  parser.add_argument("--bn-momentum", type=float, default=getenv("BN_MOMENTUM", 0.4434))
-  parser.add_argument("--logit-div", type=float, default=getenv("LOGIT_DIV", 256.0))
-  parser.add_argument("--brightness", type=float, default=getenv("BRIGHTNESS", 0.1399))
-  parser.add_argument("--contrast", type=float, default=getenv("CONTRAST", 0.1308))
   parser.add_argument("--quiet", action="store_true", default=bool(getenv("QUIET", 0)))
   parser.add_argument("--profile-phases", action="store_true", default=bool(getenv("PROFILE_PHASES", 0)))
-  parser.add_argument("--debug-stats", action="store_true", default=bool(getenv("DEBUG_STATS", 0)))
   parser.add_argument("--no-warmup", action="store_true", help="include first-time JIT compilation in wall time")
   parser.add_argument("--save-weights", type=str, default="")
   args = parser.parse_args()
-  if not 0.0 <= args.tta_base_weight <= 1.0: parser.error("--tta-base-weight must be between 0 and 1")
+  if args.batch_size <= 0: parser.error("--batch-size must be positive")
+  if args.steps <= 0: parser.error("--steps must be positive")
+  if args.eval_batch_size <= 0: parser.error("--eval-batch-size must be positive")
   if not 0.0 < args.tta_fraction <= 1.0: parser.error("--tta-fraction must be greater than 0 and at most 1")
-  if not (args.eval_batch_size * args.tta_fraction).is_integer():
-    parser.error("--tta-fraction times --eval-batch-size must be an integer")
 
   phase_start = time.perf_counter()
   def phase(name:str) -> None:
@@ -263,31 +250,35 @@ def main() -> None:
   total_start = time.perf_counter()
   Tensor.manual_seed(args.seed)
   dtypes.default_float = dtypes.half
-  model = AirbenchCifarNet(args.bn_eps, args.bn_momentum, args.logit_div, args.width)
+  model = AirbenchCifarNet(BN_EPS, BN_MOMENTUM, LOGIT_DIV, WIDTH)
   phase("model_init")
   X_train_pad, X_train_pad_flip, X_train_norm, X_test, Y_train, Y_test = preprocess_cifar()
   phase("data_preprocess")
 
   state = nn.state.get_state_dict(model)
-  hidden_convs = [v for k,v in state.items() if v.is_param and v.ndim == 4 and not k.startswith("whiten.")]
-  norm_biases = [v for k,v in state.items() if v.is_param and "norm" in k and k.endswith("bias")]
+  groups = (model.block1, model.block2, model.block3)
+  hidden_convs = [conv.conv.weight for group in groups for conv in (group.conv1, group.conv2)]
+  norm_biases = [norm.bias for group in groups for norm in (group.norm1, group.norm2)]
   whiten_bias = [model.whiten.bias]
   head = [model.head.weight]
   bn_buffers = [v for k,v in state.items() if "running_mean" in k or "running_var" in k or "num_batches_tracked" in k]
 
   batch_size, steps = args.batch_size, args.steps
-  loss_mult = 1.0 if args.loss_mult < 0 else args.loss_mult
+  if X_train_norm.shape[0] % batch_size: parser.error("--batch-size must divide the CIFAR-10 training set")
+  if X_test.shape[0] % args.eval_batch_size: parser.error("--eval-batch-size must divide the CIFAR-10 test set")
+  if not (args.eval_batch_size * args.tta_fraction).is_integer():
+    parser.error("--tta-fraction times --eval-batch-size must be an integer")
   batches_per_epoch = X_train_norm.shape[0] // batch_size
   epoch_count = math.ceil(steps / batches_per_epoch)
-  whiten_bias_steps = math.ceil(0.2 * batches_per_epoch) if args.whiten_bias_steps < 0 else args.whiten_bias_steps
-  wd = 1.0418e-6 * batch_size if args.weight_decay < 0 else args.weight_decay
-  opt_whiten = nn.optim.SGD(whiten_bias, lr=args.bias_lr, momentum=args.sgd_momentum, nesterov=True,
-                            weight_decay=wd/args.bias_lr if args.bias_lr else 0.0, fused=False)
-  opt_norm = nn.optim.SGD(norm_biases, lr=args.bias_lr, momentum=args.sgd_momentum, nesterov=True,
-                          weight_decay=wd/args.bias_lr if args.bias_lr else 0.0, fused=False)
-  opt_head = nn.optim.SGD(head, lr=args.head_lr, momentum=args.sgd_momentum, nesterov=True,
-                          weight_decay=wd/args.head_lr if args.head_lr else 0.0, fused=False)
-  opt_muon = AirbenchMuon(hidden_convs, lr=args.muon_lr, momentum=args.muon_momentum, weight_decay=wd, ns_steps=3)
+  whiten_bias_steps = math.ceil(0.2 * batches_per_epoch)
+  wd = WEIGHT_DECAY * batch_size
+  opt_whiten = nn.optim.SGD(whiten_bias, lr=BIAS_LR, momentum=SGD_MOMENTUM, nesterov=True,
+                            weight_decay=wd/BIAS_LR, fused=False)
+  opt_norm = nn.optim.SGD(norm_biases, lr=BIAS_LR, momentum=SGD_MOMENTUM, nesterov=True,
+                          weight_decay=wd/BIAS_LR, fused=False)
+  opt_head = nn.optim.SGD(head, lr=HEAD_LR, momentum=SGD_MOMENTUM, nesterov=True,
+                          weight_decay=wd/HEAD_LR, fused=False)
+  opt_muon = AirbenchMuon(hidden_convs, lr=MUON_LR, momentum=MUON_MOMENTUM, weight_decay=wd, ns_steps=3)
   phase("optim_init")
 
   mutable_tensors:list[Tensor] = []
@@ -306,10 +297,11 @@ def main() -> None:
     permutation_coefficients.append(Tensor(coefficients, dtype=dtypes.int32).realize())
 
   def set_lrs(step:int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    whiten_lr = args.bias_lr * max(0.0, 1.0 - step / whiten_bias_steps)
+    whiten_lr = BIAS_LR * max(0.0, 1.0 - step / whiten_bias_steps)
     train_scale = max(0.0, 1.0 - step / steps)
-    norm_lr = args.bias_lr * train_scale
-    return Tensor([whiten_lr], dtype=dtypes.float32), Tensor([norm_lr], dtype=dtypes.float32), Tensor([args.head_lr * train_scale], dtype=dtypes.float32), Tensor([args.muon_lr * train_scale], dtype=dtypes.float32)
+    norm_lr = BIAS_LR * train_scale
+    return Tensor([whiten_lr], dtype=dtypes.float32), Tensor([norm_lr], dtype=dtypes.float32), \
+           Tensor([HEAD_LR * train_scale], dtype=dtypes.float32), Tensor([MUON_LR * train_scale], dtype=dtypes.float32)
 
   learning_rates = [set_lrs(step) for step in range(steps)]
   Tensor.realize(*[lr for step_lrs in learning_rates for lr in step_lrs])
@@ -321,19 +313,19 @@ def main() -> None:
     return [opt_whiten.lr.assign(lr_whiten), opt_norm.lr.assign(lr_norm), opt_head.lr.assign(lr_head),
             *opt_whiten.schedule_step(), *opt_norm.schedule_step(), *opt_head.schedule_step()]
 
-  def sgd_realize_no_whiten(lr_norm:Tensor, lr_head:Tensor) -> list[Tensor]:
-    return [opt_norm.lr.assign(lr_norm), opt_head.lr.assign(lr_head), *opt_norm.schedule_step(), *opt_head.schedule_step()]
-
   def muon_realize(lr_muon:Tensor, normalize_weights:bool) -> list[Tensor]:
     opt_muon.normalize_weights = normalize_weights
     return [opt_muon.lr.assign(lr_muon), *opt_muon.schedule_step()]
+
+  def sgd_realize_no_whiten(lr_norm:Tensor, lr_head:Tensor) -> list[Tensor]:
+    return [opt_norm.lr.assign(lr_norm), opt_head.lr.assign(lr_head), *opt_norm.schedule_step(), *opt_head.schedule_step()]
 
   def train_step_impl(X_epoch:Tensor, Y_epoch:Tensor, batch, lr_whiten:Tensor|None, lr_norm:Tensor,
                       lr_head:Tensor, lr_muon:Tensor, whiten_bias_grad:bool, normalize_weights:bool) -> Tensor:
     start = batch * batch_size
     X, Y = X_epoch[start:start+batch_size], Y_epoch[start:start+batch_size]
     zero_grads(opt_whiten, opt_norm, opt_head, opt_muon)
-    loss = cross_entropy_sum(model(X, whiten_bias_grad=whiten_bias_grad), Y, args.label_smoothing) * loss_mult
+    loss = cross_entropy_sum(model(X, whiten_bias_grad=whiten_bias_grad), Y, LABEL_SMOOTHING)
     loss.backward()
     sgd = sgd_realize(lr_whiten, lr_norm, lr_head) if lr_whiten is not None else sgd_realize_no_whiten(lr_norm, lr_head)
     return loss.realize(*sgd, *muon_realize(lr_muon, normalize_weights), *bn_buffers)
@@ -361,7 +353,7 @@ def main() -> None:
   @TinyJit
   def prepare_epoch(Xsrc:Tensor, indices:Tensor) -> tuple[Tensor, Tensor]:
     X = random_crop_batch(Xsrc, indices)
-    X = batch_color_jitter(X, args.brightness, args.contrast)
+    X = batch_color_jitter(X, BRIGHTNESS, CONTRAST)
     return activation_buffer(X).realize(), Y_train[indices].contiguous().realize()
 
   @TinyJit
@@ -377,7 +369,7 @@ def main() -> None:
     logits = model(Tensor.cat(base_views, base_views.flip(-1), dim=0), whiten_bias_grad=False).reshape(6, X.shape[0], 10)
     base = (logits[0] + logits[3]) * 0.5
     translated = (logits[1] + logits[2] + logits[4] + logits[5]) * 0.25
-    return base * args.tta_base_weight + translated * (1.0 - args.tta_base_weight)
+    return base * TTA_BASE_WEIGHT + translated * (1.0 - TTA_BASE_WEIGHT)
 
   @TinyJit
   @Context(TRAINING=0)
@@ -393,24 +385,44 @@ def main() -> None:
 
   @TinyJit
   @Context(TRAINING=0)
-  def eval_step_tta2(i) -> Tensor:
-    X, Y = X_test[i:i+args.eval_batch_size], Y_test[i:i+args.eval_batch_size]
-    logits = model(X, whiten_bias_grad=False)
-    if args.tta_score == "margin":
-      top_two, _ = logits.topk(2)
-      confidence = top_two[:, 0] - top_two[:, 1]
-    else: confidence = logits.softmax(axis=1).max(axis=1)
-    _, uncertain = confidence.topk(round(args.eval_batch_size * args.tta_fraction), largest=False)
-    base_correct = logits.argmax(axis=1) == Y
-    selected_correct = base_correct[uncertain].sum()
-    tta_correct = (infer_tta2(X[uncertain]).argmax(axis=1) == Y[uncertain]).sum()
-    return (base_correct.sum() - selected_correct + tta_correct).realize()
+  def eval_base_logits(i) -> Tensor:
+    return model(X_test[i:i+args.eval_batch_size], whiten_bias_grad=False).realize()
 
   eval_i = Variable("eval_i", 0, X_test.shape[0] - args.eval_batch_size)
+  selected_count = round(X_test.shape[0] * args.tta_fraction)
+  selected_batch_size = round(args.eval_batch_size * args.tta_fraction)
+  assert selected_count % selected_batch_size == 0
+  selected_i = Variable("selected_i", 0, selected_count - selected_batch_size)
+
+  @TinyJit
+  @Context(TRAINING=0)
+  def eval_select_global(*chunks:Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    logits = Tensor.cat(*chunks, dim=0)
+    uncertain = select_tta_indices(logits, selected_count)
+    base_correct = logits.argmax(axis=1) == Y_test
+    return uncertain.realize(), base_correct.sum().realize(), base_correct[uncertain].sum().realize()
+
+  @TinyJit
+  @Context(TRAINING=0)
+  def eval_selected_tta(indices:Tensor, i, correct:Tensor) -> Tensor:
+    batch_indices = indices[i:i+selected_batch_size]
+    X, Y = X_test[batch_indices], Y_test[batch_indices]
+    return correct.assign(correct + (infer_tta2(X).argmax(axis=1) == Y).sum()).realize()
+
+  @TinyJit
+  def eval_finalize(base_correct:Tensor, base_selected:Tensor, tta_correct:Tensor) -> Tensor:
+    return (base_correct - base_selected + tta_correct).realize()
 
   def evaluate() -> Tensor:
     assert X_test.shape[0] % args.eval_batch_size == 0, "eval batch size must divide CIFAR-10 test size"
-    eval_fn = (eval_step_basic, eval_step_mirror, eval_step_tta2)[args.tta_level]
+    if args.tta_level == 2:
+      chunks = [eval_base_logits(eval_i.bind(i)).clone().realize() for i in range(0, X_test.shape[0], args.eval_batch_size)]
+      uncertain, base_correct, base_selected = eval_select_global(*chunks)
+      selected_correct = Tensor.zeros((), dtype=dtypes.int32).clone().realize()
+      for i in range(0, selected_count, selected_batch_size):
+        eval_selected_tta(uncertain, selected_i.bind(i), selected_correct)
+      return eval_finalize(base_correct, base_selected, selected_correct)
+    eval_fn = (eval_step_basic, eval_step_mirror)[args.tta_level]
     correct = Tensor.zeros((), dtype=dtypes.int32).realize()
     for i in range(0, X_test.shape[0], args.eval_batch_size):
       correct = (correct + eval_fn(eval_i.bind(i)).cast(dtypes.int32)).realize()
@@ -437,17 +449,19 @@ def main() -> None:
     for _ in range(2): train_step_bias_norm(X_warm, Y_warm, warm_batch, *warm_lrs)
     for _ in range(2): train_step(X_warm, Y_warm, warm_batch, *warm_lrs[1:])
     for _ in range(2): train_step_norm(X_warm, Y_warm, warm_batch, *warm_lrs[1:])
-    eval_fn = (eval_step_basic, eval_step_mirror, eval_step_tta2)[args.tta_level]
-    # These small/one-shot graphs are faster without spending minutes on kernel search.
-    old_jitbeam = os.environ.get("JITBEAM")
-    os.environ["JITBEAM"] = "0"
-    try:
-      whitening_images = X_train_norm[:960].contiguous().realize()
-      for _ in range(2): whitening_covariance(whitening_images)
+    whitening_images = X_train_norm[:960].contiguous().realize()
+    for _ in range(2): whitening_covariance(whitening_images)
+    if args.tta_level == 2:
+      warm_chunks = []
+      for i in range(0, X_test.shape[0], args.eval_batch_size):
+        warm_chunks.append(eval_base_logits(eval_i.bind(i)).clone().realize())
+      for _ in range(2): warm_selected, warm_base, warm_base_selected = eval_select_global(*warm_chunks)
+      warm_correct = Tensor.zeros((), dtype=dtypes.int32).clone().realize()
+      for _ in range(2): eval_selected_tta(warm_selected, selected_i.bind(0), warm_correct)
+      for _ in range(2): eval_finalize(warm_base, warm_base_selected, warm_correct)
+    else:
+      eval_fn = (eval_step_basic, eval_step_mirror)[args.tta_level]
       for _ in range(2): eval_fn(eval_i.bind(0))
-    finally:
-      if old_jitbeam is None: os.environ.pop("JITBEAM")
-      else: os.environ["JITBEAM"] = old_jitbeam
     Device[Device.DEFAULT].synchronize()
     compile_warmup = time.perf_counter() - warmup_start
     Tensor.realize(*[tensor.assign(value) for tensor, value in zip(mutable_tensors, initial_values)])
@@ -480,8 +494,8 @@ def main() -> None:
       if detail_profile:
         Device[Device.DEFAULT].synchronize()
         detail_start = time.perf_counter()
-      normalize_weights = step + 1 in norm_steps
       batch = train_batch.bind(epoch_step)
+      normalize_weights = step + 1 in norm_steps
       if step < whiten_bias_steps:
         train_fn = train_step_bias_norm if normalize_weights else train_step_bias
         train_fn(X_epoch, Y_epoch, batch, lr_whiten, lr_norm, lr_head, lr_muon)
@@ -504,6 +518,7 @@ def main() -> None:
     print(f"phase=timed_train seconds={train_end-train_start:.4f}", flush=True)
   eval_start = time.perf_counter()
   correct = evaluate()
+  correct_count = int(correct.numpy().item())
   Device[Device.DEFAULT].synchronize()
   end_time = time.perf_counter()
   wall_time = end_time - t0
@@ -511,35 +526,32 @@ def main() -> None:
   if args.profile_phases and not args.quiet:
     print(f"phase=timed_eval seconds={time.perf_counter()-eval_start:.4f}", flush=True)
 
-  correct_count = int(correct.numpy().item())
   acc = correct_count / X_test.shape[0] * 100.0
-  if args.debug_stats and not args.quiet:
-    logits = model(X_test[:args.eval_batch_size], whiten_bias_grad=False).realize()
-    print(f"debug_logits min={float(logits.min().numpy().item()):.4f} max={float(logits.max().numpy().item()):.4f} mean={float(logits.mean().numpy().item()):.4f}", flush=True)
-    param_nans, grad_nans, grad_seen = 0, 0, 0
-    for p in nn.state.get_state_dict(model).values():
-      param_nans += int(p.isnan().sum().numpy().item())
-      if p.grad is not None:
-        grad_seen += 1
-        grad_nans += int(p.grad.isnan().sum().numpy().item())
-    print(f"debug_nans params={param_nans} grads={grad_nans} grad_tensors={grad_seen}", flush=True)
-  if args.save_weights:
-    nn.state.safe_save(nn.state.get_state_dict(model), args.save_weights)
   if not args.quiet:
-    try: gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"], text=True).strip().splitlines()[0]
+    gpu_id = os.getenv("SLURM_JOB_GPUS", os.getenv("CUDA_VISIBLE_DEVICES", "")).split(",")[0]
+    gpu_query = ["nvidia-smi", "--query-gpu=uuid,name,driver_version", "--format=csv,noheader"]
+    if gpu_id: gpu_query += ["-i", gpu_id]
+    try: gpu_info = subprocess.check_output(gpu_query, text=True).strip().splitlines()[0]
     except Exception: gpu_info = "unknown"
-    try: commit = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
-    except Exception: commit = "unknown"
-    print(f"hardware={gpu_info} tinygrad_commit={commit}")
+    try:
+      commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+      dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], text=True).strip())
+    except Exception: commit, dirty = "unknown", "unknown"
+    print(f"hardware={gpu_info} tinygrad_commit={commit} git_dirty={dirty}")
     print(f"runtime DEV={Device.DEFAULT} DEFAULT_FLOAT={dtypes.default_float} JITBEAM={getenv('JITBEAM', 0)}")
-  print(f"device={Device.DEFAULT} seed={args.seed} steps={steps} batch_size={batch_size} width={args.width} "
-        f"whiten_bias_steps={whiten_bias_steps} tta_level={args.tta_level} tta_base_weight={args.tta_base_weight:.2f} "
-        f"tta_fraction={args.tta_fraction:.3f} tta_score={args.tta_score}")
-  print("timed_region=whitening_train_eval")
-  print(f"accuracy={acc:.2f} correct={correct_count}/{X_test.shape[0]} wall_time_s={wall_time:.4f} "
-        f"compile_warmup_s={compile_warmup:.4f} end_to_end_s={total_time:.4f}")
+  print(f"device={Device.DEFAULT} seed={args.seed} steps={steps} batch_size={batch_size} width={WIDTH} "
+        f"whiten_bias_steps={whiten_bias_steps} tta_level={args.tta_level} tta_base_weight={TTA_BASE_WEIGHT:.2f} "
+        f"tta_fraction={args.tta_fraction:.3f} tta_score=margin")
+  print(f"optimizer bias_lr={BIAS_LR:.6f} head_lr={HEAD_LR:.6f} muon_lr={MUON_LR:.6f} "
+        f"sgd_momentum={SGD_MOMENTUM:.4f} muon_momentum={MUON_MOMENTUM:.4f} weight_decay={wd:.8f}")
+  print(f"loss label_smoothing={LABEL_SMOOTHING:.4f} loss_mult=1.0000 "
+        f"bn_eps={BN_EPS:.2g} bn_momentum={BN_MOMENTUM:.4f} logit_div={LOGIT_DIV:.4f}")
+  print("benchmark_region=whitening_train_eval_accuracy_readback compile_warmup=excluded")
+  print(f"accuracy={acc:.2f} correct={correct_count}/{X_test.shape[0]} benchmark_wall_time_s={wall_time:.4f} "
+        f"compile_warmup_s={compile_warmup:.4f} after_import_wall_time_s={total_time:.4f}")
   if args.target_acc and acc < args.target_acc: raise SystemExit(f"accuracy {acc:.2f} < target {args.target_acc:.2f}")
-  if args.target_time and wall_time >= args.target_time: raise SystemExit(f"wall_time {wall_time:.4f} >= target {args.target_time:.4f}")
+  if args.target_time and wall_time >= args.target_time: raise SystemExit(f"benchmark wall time {wall_time:.4f} >= target {args.target_time:.4f}")
+  if args.save_weights: nn.state.safe_save(nn.state.get_state_dict(model), args.save_weights)
 
 if __name__ == "__main__":
   if TRAINING: raise RuntimeError("run without TRAINING in the environment")

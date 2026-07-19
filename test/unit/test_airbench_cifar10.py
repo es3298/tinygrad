@@ -1,9 +1,11 @@
-import unittest
+import contextlib, io, sys, unittest
+from unittest.mock import patch
 import numpy as np
 
 from tinygrad import Tensor, dtypes
 from tinygrad.helpers import Context
-from examples.airbench_cifar10 import AirbenchMuon, NS_COEFFS, airbench_conv2d, random_permutation, whitening_covariance
+from examples.airbench_cifar10 import (AirbenchBatchNorm, AirbenchMuon, NS_COEFFS, airbench_conv2d, main, random_permutation,
+                                       select_tta_indices, whitening_covariance)
 
 
 class TestAirbenchCifar10(unittest.TestCase):
@@ -30,6 +32,49 @@ class TestAirbenchCifar10(unittest.TestCase):
       with Context(TRAINING=1): Tensor.realize(*optimizer.schedule_step())
       for actual, target in zip(params, expected): np.testing.assert_allclose(actual.numpy(), target.numpy(), atol=2e-5, rtol=2e-5)
       reference = expected
+
+  def test_muon_first_step_matches_numpy(self):
+    param_np = np.array([[[[0.2]], [[-0.3]], [[0.5]]], [[[0.7]], [[0.1]], [[-0.4]]]], dtype=np.float32)
+    grad_np = np.array([[[[0.4]], [[-0.2]], [[0.1]]], [[[-0.5]], [[0.3]], [[0.6]]]], dtype=np.float32)
+    lr, momentum, weight_decay = 0.1, 0.6, 0.02
+    param = Tensor(param_np, device="PYTHON").realize().is_param_()
+    param.grad = Tensor(grad_np, device="PYTHON").realize()
+    optimizer = AirbenchMuon([param], lr=lr, momentum=momentum, weight_decay=weight_decay, ns_steps=3)
+    optimizer.normalize_weights = False
+    with Context(TRAINING=1): Tensor.realize(*optimizer.schedule_step())
+
+    update = grad_np * (1.0 + momentum)
+    matrix = update.reshape(update.shape[0], -1)
+    matrix = matrix / (np.sqrt(np.square(matrix).sum()) + 1e-7)
+    a, b, c = NS_COEFFS
+    for _ in range(3):
+      gram = matrix @ matrix.T
+      matrix = a * matrix + (b * gram + c * (gram @ gram)) @ matrix
+    expected = (param_np - lr * matrix.reshape(param_np.shape)) * (1.0 - lr * weight_decay)
+    np.testing.assert_allclose(param.numpy(), expected, atol=8e-3, rtol=8e-3)
+
+  def test_batchnorm_keeps_fixed_scale_out_of_autograd(self):
+    default_float = dtypes.default_float
+    try:
+      dtypes.default_float = dtypes.half
+      norm = AirbenchBatchNorm(3, eps=1e-12, momentum=0.4)
+      x = Tensor.randn(2, 3, 4, 4, dtype=dtypes.half, device="PYTHON").realize().is_param_()
+      with Context(TRAINING=1): norm(x).sum().backward()
+      Tensor.realize(x.grad, norm.bias.grad, norm.running_mean, norm.running_var)
+      self.assertIsNone(norm.weight)
+      self.assertEqual(norm.running_mean.dtype, dtypes.float32)
+      self.assertEqual(norm.running_var.dtype, dtypes.float32)
+      self.assertIsNotNone(norm.bias.grad)
+    finally: dtypes.default_float = default_float
+
+  def test_zero_steps_are_rejected_before_setup(self):
+    with contextlib.redirect_stderr(io.StringIO()), patch.object(sys, "argv", ["airbench_cifar10.py", "--steps", "0"]), \
+         self.assertRaises(SystemExit):
+      main()
+
+  def test_tta_selection_uses_global_confidence(self):
+    logits = Tensor([[1.0, 0.9, 0.0], [3.0, 0.1, 0.0], [1.0, 0.8, 0.0], [4.0, 0.0, 0.0]], device="PYTHON")
+    self.assertEqual(sorted(select_tta_indices(logits, 2).tolist()), [0, 2])
 
   def test_modular_shuffle_is_permutation(self):
     coefficients = Tensor([[1, 2, 3, 4], [4, 0, 6, 2], [3, 1, 5, 0], [2, 4, 1, 3]], dtype=dtypes.int32)
