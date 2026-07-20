@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
-"""Train CIFAR-10 to 94% with a tinygrad-tuned Airbench/Hiverge recipe.
+"""Train CIFAR-10 with a tinygrad-tuned Airbench/Hiverge recipe.
 
-TinyJit compilation is warmed before the timed region. Whitening, training, evaluation, and accuracy readback are timed.
+First-call TinyJit capture is included in the pipeline timer. Use an external timer for whole-process wall time.
 The recipe is derived from MIT-licensed Airbench and Hiverge code, then retuned for tinygrad's NV backend on one L40S:
 https://github.com/KellerJordan/cifar10-airbench/tree/4c1b6d1e3889b037efadcfd5c0ea65b246592362
 https://github.com/hiverge/cifar10-speedrun/tree/06c60727547042c847d919c5848e807e8119d582
 
-Run on one NVIDIA GPU with: DEV=NV JITBEAM=4 python3 examples/airbench_cifar10.py
+Run on one NVIDIA GPU with: DEV=NV JITBEAM=2 python3 examples/airbench_cifar10.py
 """
-import argparse, math, os, subprocess, time
-import numpy as np
-from tinygrad import Tensor, TinyJit, UOp, Device, dtypes, nn, Variable
+import argparse, math, time
+from tinygrad import Tensor, TinyJit, Device, dtypes, nn, Variable
 from tinygrad.helpers import Context, getenv, TRAINING
-from tinygrad.uop.ops import KernelInfo
 
 CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR_STD = (0.2470, 0.2435, 0.2616)
 NS_COEFFS = (3.4576, -4.7391, 2.0843)
-WIDTH, BN_EPS, BN_MOMENTUM, LOGIT_DIV = 256, 1e-12, 0.4434, 256.0
-BIAS_LR, HEAD_LR, MUON_LR = 0.0573, 0.5415, 0.205
-SGD_MOMENTUM, MUON_MOMENTUM, WEIGHT_DECAY = 0.825, 0.655, 1.0418e-6
-LABEL_SMOOTHING, BRIGHTNESS, CONTRAST = 0.09, 0.1399, 0.1308
-TTA_BASE_WEIGHT = 0.2
+BN_EPS, BN_MOMENTUM = 1e-12, getenv("BN_MOMENTUM", 0.4434)
+BIAS_LR, HEAD_LR, MUON_LR = getenv("BIAS_LR", 0.0573), getenv("HEAD_LR", 0.540), getenv("MUON_LR", 0.2425)
+SGD_MOMENTUM, MUON_MOMENTUM = getenv("SGD_MOMENTUM", 0.825), getenv("MUON_MOMENTUM", 0.655)
+WEIGHT_DECAY = getenv("WEIGHT_DECAY", 1.0418e-6)
+LABEL_SMOOTHING = getenv("LABEL_SMOOTHING", 0.09)
+BRIGHTNESS, CONTRAST = getenv("BRIGHTNESS", 0.1399), getenv("CONTRAST", 0.1308)
+WHITEN_BIAS_SCALE, WHITEN_BIAS_OFFSET = getenv("WHITEN_BIAS_SCALE", 0.80), getenv("WHITEN_BIAS_OFFSET", 0.3375)
 
 def whiten_activ(x:Tensor) -> Tensor:
   return x.gelu("none")
@@ -32,42 +32,14 @@ def block_activ(x:Tensor) -> Tensor:
 def activation_buffer(x:Tensor) -> Tensor:
   return x.contiguous()
 
-def _conv_weight_grad(x:Tensor, dy:Tensor) -> Tensor:
-  n, cin, h, w = x.shape
-  cout = dy.shape[1]
-  patches = x.pad((1, 1, 1, 1))._pool((3, 3)).permute(0, 2, 3, 1, 4, 5).reshape(n * h * w, cin * 9)
-  dy_matrix = dy.permute(0, 2, 3, 1).reshape(n * h * w, cout).contiguous()
-  return dy_matrix.T.matmul(patches).reshape(cout, cin, 3, 3)
-
-def _conv_input_grad(dy:Tensor, weight:Tensor) -> Tensor:
-  n, cout, h, w = dy.shape
-  cin = weight.shape[1]
-  dy_matrix = dy.permute(0, 2, 3, 1).reshape(n * h * w, cout).contiguous()
-  dpatches = dy_matrix.matmul(weight.reshape(cout, cin * 9).contiguous()).reshape(n, h, w, cin, 3, 3)
-  parts = []
-  for ky in range(3):
-    for kx in range(3):
-      part = dpatches[:, :, :, :, ky, kx].permute(0, 3, 1, 2)
-      parts.append(part.pad((kx, 2-kx, ky, 2-ky))[:, :, 1:-1, 1:-1])
-  return Tensor.stack(*parts).sum(axis=0)
-
-def _conv_gradient_hook(_raw:UOp, _x:UOp, _weight:UOp) -> UOp:
-  # custom_kernel's AFTER edge is tinygrad's supported way to attach a custom gradient
-  # while retaining the scheduler-optimized forward matmul.
-  return UOp.sink(arg=KernelInfo(name="airbench_conv_gradient_hook"))
-
 def airbench_conv2d(x:Tensor, weight:Tensor) -> Tensor:
   """3x3 padded convolution with GEMM-shaped gradients for NVIDIA tensor cores."""
   n, cin, h, w = x.shape
   cout = weight.shape[0]
-  patches = x.detach().pad((1, 1, 1, 1))._pool((3, 3)).permute(0, 2, 3, 1, 4, 5).reshape(n * h * w, cin * 9)
-  raw = patches.contiguous().matmul(weight.detach().reshape(cout, cin * 9).T)
-  def backward(grad:UOp, call:UOp) -> tuple[None, UOp, UOp]:
-    _raw, call_x, call_weight = call.src[1:]
-    dy = Tensor(grad).cast(call_x.dtype).reshape(n, h, w, cout).permute(0, 3, 1, 2)
-    return None, _conv_input_grad(dy, Tensor(call_weight)).uop, _conv_weight_grad(Tensor(call_x), dy).uop
-  raw = Tensor.custom_kernel(raw, x, weight, fxn=_conv_gradient_hook, grad_fxn=backward)[0]
-  return raw.reshape(n, h, w, cout).permute(0, 3, 1, 2)
+  patches = x.pad((1, 1, 1, 1))._pool((3, 3)).permute(0, 2, 3, 1, 4, 5).reshape(n * h * w, cin * 9)
+  patches = patches.contiguous().contiguous_backward()
+  out = (patches @ weight.reshape(cout, cin * 9).T).contiguous().contiguous_backward()
+  return out.reshape(n, h, w, cout).permute(0, 3, 1, 2)
 
 class AirbenchBatchNorm(nn.BatchNorm2d):
   def __init__(self, channels:int, eps:float, momentum:float):
@@ -97,19 +69,20 @@ class ConvGroup:
     return activation_buffer(block_activ(self.norm2(x).cast(dtypes.default_float)))
 
 class AirbenchCifarNet:
-  def __init__(self, bn_eps:float, bn_momentum:float, logit_div:float, width:int=256):
+  def __init__(self, bn_eps:float, bn_momentum:float, width:int=256):
     self.whiten = nn.Conv2d(3, 24, kernel_size=2, padding=0, bias=True)
     self.whiten.weight.is_param_(False)
+    self.whiten.bias.is_param_(False)
     self.block1 = ConvGroup(24, 64, bn_eps, bn_momentum)
     self.block2 = ConvGroup(64, width, bn_eps, bn_momentum)
     self.block3 = ConvGroup(width, width, bn_eps, bn_momentum)
     self.head = nn.Linear(width, 10, bias=False)
-    self.logit_div = logit_div
-    self.head.weight.assign((self.head.weight / self.head.weight.float().std()).cast(self.head.weight.dtype))
+    self.logit_div = float(width)
+    self.head.weight.replace((self.head.weight / self.head.weight.float().std()).cast(self.head.weight.dtype).clone())
 
-  def __call__(self, x:Tensor, whiten_bias_grad=True) -> Tensor:
-    bias = self.whiten.bias if whiten_bias_grad else self.whiten.bias.detach()
-    x = activation_buffer(whiten_activ(x.conv2d(self.whiten.weight.detach(), bias)))
+  def __call__(self, x:Tensor) -> Tensor:
+    # Aligned 32x32 feature maps are substantially faster than the whitening layer's native 31x31 output on tinygrad.
+    x = activation_buffer(whiten_activ(x.conv2d(self.whiten.weight.detach(), self.whiten.bias.detach())).pad((1, 0, 0, 1)))
     x = activation_buffer(self.block1(x))
     x = activation_buffer(self.block2(x))
     x = activation_buffer(self.block3(x))
@@ -120,7 +93,7 @@ class AirbenchMuon(nn.optim.Optimizer):
   def __init__(self, params:list[Tensor], lr=0.205, momentum=0.655, weight_decay=0.0, ns_steps=3):
     super().__init__(params, lr, fused=False)
     self.momentum, self.weight_decay, self.ns_steps = momentum, weight_decay, ns_steps
-    self.normalize_weights = False
+    self.normalize_weights:bool|Tensor = False
     self.b = self._new_optim_param()
 
   def _step(self, params:list[Tensor], grads:list[Tensor]) -> tuple[list[Tensor], list[Tensor]]:
@@ -140,19 +113,21 @@ class AirbenchMuon(nn.optim.Optimizer):
     updates = []
     for p, g in zip(params, momentum_grads):
       base = p.detach()
-      if self.normalize_weights: base = base * ((p.shape[0] ** 0.5) / (base.float().square().sum().sqrt() + 1e-7))
+      if self.normalize_weights is not False:
+        normalized = base * ((p.shape[0] ** 0.5) / (base.float().square().sum().sqrt() + 1e-7))
+        base = normalized if self.normalize_weights is True else self.normalize_weights.where(normalized, base)
       updated = (base - self.lr * g.cast(p.dtype)) * (1.0 - self.lr * self.weight_decay)
       updates.append((p.detach() - updated).cast(p.dtype))
     return updates, self.b
 
 def dirac_init_(conv:nn.Conv2d) -> None:
   # Match Airbench: preserve random expansion channels, Dirac only the first input-width block.
-  w = conv.weight.float().numpy().astype(np.float32)
-  oc, ic, kh, kw = w.shape
+  oc, ic, kh, kw = conv.weight.shape
   n = min(oc, ic)
-  w[:n] = 0.0
-  for i in range(n): w[i, i, kh//2, kw//2] = 1.0
-  conv.weight.assign(Tensor(w, dtype=dtypes.float32).cast(conv.weight.dtype))
+  identity = Tensor.eye(n, dtype=conv.weight.dtype).reshape(n, n, 1, 1)
+  identity = identity.pad((kw//2, kw-kw//2-1, kh//2, kh-kh//2-1, 0, ic-n))
+  weight = identity.cat(conv.weight[n:].detach(), dim=0) if oc > n else identity
+  conv.weight.replace(weight.clone())
 
 def pad_reflect(X:Tensor, size=2) -> Tensor:
   X = X[...,:,1:size+1].flip(-1).cat(X, X[...,:,-(size+1):-1].flip(-1), dim=-1)
@@ -187,19 +162,81 @@ def batch_color_jitter(X:Tensor, brightness:float, contrast:float) -> Tensor:
 def batch_random_flip(X:Tensor) -> Tensor:
   return (Tensor.rand(X.shape[0], 1, 1, 1) < 0.5).where(X.flip(-1), X)
 
-@TinyJit
+def symmetric_eigh(matrix:list[list[float]], tolerance=1e-10) -> tuple[list[float], list[list[float]]]:
+  """Eigenvalues and column eigenvectors of a small real symmetric matrix using Jacobi rotations."""
+  size = len(matrix)
+  if size == 0 or any(len(row) != size for row in matrix): raise ValueError("matrix must be non-empty and square")
+  values = [list(map(float, row)) for row in matrix]
+  vectors = [[float(row == col) for col in range(size)] for row in range(size)]
+  for _ in range(100 * size * size):
+    p, q = 0, 1
+    largest = abs(values[p][q]) if size > 1 else 0.0
+    for row in range(size - 1):
+      for col in range(row + 1, size):
+        if abs(values[row][col]) > largest: p, q, largest = row, col, abs(values[row][col])
+    if largest <= tolerance: break
+
+    app, aqq, apq = values[p][p], values[q][q], values[p][q]
+    tau = (aqq - app) / (2.0 * apq)
+    tangent = (1.0 if tau >= 0.0 else -1.0) / (abs(tau) + math.sqrt(1.0 + tau * tau))
+    cosine = 1.0 / math.sqrt(1.0 + tangent * tangent)
+    sine = tangent * cosine
+    for idx in range(size):
+      if idx in (p, q): continue
+      aip, aiq = values[idx][p], values[idx][q]
+      values[idx][p] = values[p][idx] = cosine * aip - sine * aiq
+      values[idx][q] = values[q][idx] = sine * aip + cosine * aiq
+    values[p][p] = cosine*cosine*app - 2.0*sine*cosine*apq + sine*sine*aqq
+    values[q][q] = sine*sine*app + 2.0*sine*cosine*apq + cosine*cosine*aqq
+    values[p][q] = values[q][p] = 0.0
+    for row in range(size):
+      vip, viq = vectors[row][p], vectors[row][q]
+      vectors[row][p] = cosine * vip - sine * viq
+      vectors[row][q] = sine * vip + cosine * viq
+  else: raise RuntimeError("symmetric eigendecomposition did not converge")
+
+  order = sorted(range(size), key=lambda idx: values[idx][idx])
+  eigenvalues = [values[idx][idx] for idx in order]
+  eigenvectors = [[vectors[row][idx] for idx in order] for row in range(size)]
+  for col in range(size):
+    pivot = max(range(size), key=lambda row: abs(eigenvectors[row][col]))
+    if eigenvectors[pivot][col] < 0.0:
+      for row in range(size): eigenvectors[row][col] = -eigenvectors[row][col]
+  return eigenvalues, eigenvectors
+
+def permutation_parameters(seed:int, epochs:int, rows:int, cols:int) -> Tensor:
+  """Generate deterministic modular-shuffle coefficients without importing a numerical RNG library."""
+  state, mask = seed & 0xffffffffffffffff, 0xffffffffffffffff
+  def randbelow(limit:int) -> int:
+    nonlocal state
+    state = (state + 0x9e3779b97f4a7c15) & mask
+    value = state
+    value = ((value ^ (value >> 30)) * 0xbf58476d1ce4e5b9) & mask
+    value = ((value ^ (value >> 27)) * 0x94d049bb133111eb) & mask
+    value ^= value >> 31
+    return (value * limit) >> 64
+  return Tensor([[[randbelow(rows), randbelow(rows), randbelow(cols), randbelow(cols)] for _ in range(4)]
+                 for _ in range(epochs)], dtype=dtypes.int32).realize()
+
 @Context(ALLOW_TF32=0)
 def whitening_covariance(images:Tensor) -> Tensor:
   patches = images.float()._pool((2, 2)).permute(0, 2, 3, 1, 4, 5).reshape(-1, 12)
   return ((patches.T @ patches) / patches.shape[0]).realize()
 
+@Context(ALLOW_TF32=0)
+def whitening_patch_mean(images:Tensor) -> Tensor:
+  patches = images.float()._pool((2, 2)).permute(0, 2, 3, 1, 4, 5).reshape(-1, 12)
+  return patches.mean(axis=0).realize()
+
 def init_whitening_(model:AirbenchCifarNet, train_images:Tensor, eps=5e-4, n=5000) -> None:
   images = train_images[:n].contiguous().realize()
-  cov = whitening_covariance(images).numpy()
-  vals, vecs = np.linalg.eigh(cov, UPLO="U")
-  w12 = (vecs.T.reshape(-1, 3, 2, 2) / np.sqrt(vals.reshape(-1,1,1,1) + eps)).astype(np.float32)
-  w = np.concatenate((w12, -w12), axis=0)
-  model.whiten.weight.assign(Tensor(w, dtype=dtypes.float32).cast(dtypes.default_float)).realize()
+  vals, vecs = symmetric_eigh(whitening_covariance(images).tolist())
+  w12 = [[vecs[row][col] / math.sqrt(vals[col] + eps) for row in range(12)] for col in range(12)]
+  w = w12 + [[-value for value in row] for row in w12]
+  model.whiten.weight.replace(Tensor(w, dtype=dtypes.float32).reshape(24, 3, 2, 2).cast(dtypes.default_float).clone().realize())
+  patch_mean = whitening_patch_mean(images).tolist()
+  bias = [-sum(value * mean for value, mean in zip(row, patch_mean)) * WHITEN_BIAS_SCALE + WHITEN_BIAS_OFFSET for row in w]
+  model.whiten.bias.assign(Tensor(bias, dtype=model.whiten.bias.dtype)).realize()
 
 def preprocess_cifar() -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
   X_train, Y_train, X_test, Y_test = nn.datasets.cifar()
@@ -208,36 +245,36 @@ def preprocess_cifar() -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
   scale = Tensor(255.0, dtype=dtypes.default_float)
   X_train = ((X_train.cast(dtypes.default_float) / scale - mean) / std).realize()
   X_test = activation_buffer((X_test.cast(dtypes.default_float) / scale - mean) / std).realize()
-  X_flip = batch_random_flip(X_train).realize()
-  return pad_reflect(X_flip, 2).realize(), pad_reflect(X_flip.flip(-1), 2).realize(), X_train, X_test.realize(), Y_train.realize(), Y_test.realize()
+  X_train_pad = pad_reflect(batch_random_flip(X_train), 2).realize()
+  X_train_pad_flip = X_train_pad.flip(-1).contiguous().realize()
+  return X_train_pad, X_train_pad_flip, X_train, X_test.realize(), Y_train.realize(), Y_test.realize()
 
 def cross_entropy_sum(logits:Tensor, labels:Tensor, label_smoothing:float) -> Tensor:
   return logits.float().sparse_categorical_crossentropy(labels, reduction="sum", label_smoothing=label_smoothing)
 
-def select_tta_indices(logits:Tensor, count:int) -> Tensor:
-  top_two, _ = logits.topk(2)
-  confidence = top_two[:, 0] - top_two[:, 1]
-  return confidence.topk(count, largest=False)[1]
-
 def main() -> None:
   parser = argparse.ArgumentParser(description="Airbench/Hiverge CIFAR-10 speed benchmark in tinygrad")
   parser.add_argument("--batch-size", type=int, default=getenv("BS", 2000))
-  parser.add_argument("--steps", type=int, default=getenv("STEPS", 200))
+  parser.add_argument("--steps", type=int, default=getenv("STEPS", 142))
+  parser.add_argument("--width", type=int, default=getenv("WIDTH", 224))
+  parser.add_argument("--muon-normalization", choices=("periodic", "always", "never"), default="periodic")
   parser.add_argument("--eval-batch-size", type=int, default=getenv("EVAL_BS", 2000))
-  parser.add_argument("--tta-level", type=int, choices=(0, 1, 2), default=getenv("TTA_LEVEL", 2))
-  parser.add_argument("--tta-fraction", type=float, default=getenv("TTA_FRACTION", 0.18))
-  parser.add_argument("--seed", type=int, default=getenv("SEED", 2))
-  parser.add_argument("--target-acc", type=float, default=getenv("TARGET_EVAL_ACC_PCT", 94.0))
+  parser.add_argument("--tta-level", type=int, choices=(0, 1), default=getenv("TTA_LEVEL", 1),
+                      help="0 disables TTA, 1 averages each image with its mirror")
+  parser.add_argument("--tta-base-weight", type=float, default=getenv("TTA_BASE_WEIGHT", 0.505),
+                      help="weight of the original image when mirror TTA is enabled")
+  parser.add_argument("--seed", type=int, default=getenv("SEED", 6))
+  parser.add_argument("--target-acc", type=float, default=getenv("TARGET_EVAL_ACC_PCT", 93.5))
   parser.add_argument("--target-time", type=float, default=getenv("TARGET_TIME_S", 10.0))
   parser.add_argument("--quiet", action="store_true", default=bool(getenv("QUIET", 0)))
   parser.add_argument("--profile-phases", action="store_true", default=bool(getenv("PROFILE_PHASES", 0)))
-  parser.add_argument("--no-warmup", action="store_true", help="include first-time JIT compilation in wall time")
   parser.add_argument("--save-weights", type=str, default="")
   args = parser.parse_args()
   if args.batch_size <= 0: parser.error("--batch-size must be positive")
   if args.steps <= 0: parser.error("--steps must be positive")
+  if args.width <= 0: parser.error("--width must be positive")
   if args.eval_batch_size <= 0: parser.error("--eval-batch-size must be positive")
-  if not 0.0 < args.tta_fraction <= 1.0: parser.error("--tta-fraction must be greater than 0 and at most 1")
+  if not 0.0 <= args.tta_base_weight <= 1.0: parser.error("--tta-base-weight must be between 0 and 1")
 
   phase_start = time.perf_counter()
   def phase(name:str) -> None:
@@ -250,7 +287,7 @@ def main() -> None:
   total_start = time.perf_counter()
   Tensor.manual_seed(args.seed)
   dtypes.default_float = dtypes.half
-  model = AirbenchCifarNet(BN_EPS, BN_MOMENTUM, LOGIT_DIV, WIDTH)
+  model = AirbenchCifarNet(BN_EPS, BN_MOMENTUM, args.width)
   phase("model_init")
   X_train_pad, X_train_pad_flip, X_train_norm, X_test, Y_train, Y_test = preprocess_cifar()
   phase("data_preprocess")
@@ -259,21 +296,15 @@ def main() -> None:
   groups = (model.block1, model.block2, model.block3)
   hidden_convs = [conv.conv.weight for group in groups for conv in (group.conv1, group.conv2)]
   norm_biases = [norm.bias for group in groups for norm in (group.norm1, group.norm2)]
-  whiten_bias = [model.whiten.bias]
   head = [model.head.weight]
   bn_buffers = [v for k,v in state.items() if "running_mean" in k or "running_var" in k or "num_batches_tracked" in k]
 
   batch_size, steps = args.batch_size, args.steps
   if X_train_norm.shape[0] % batch_size: parser.error("--batch-size must divide the CIFAR-10 training set")
   if X_test.shape[0] % args.eval_batch_size: parser.error("--eval-batch-size must divide the CIFAR-10 test set")
-  if not (args.eval_batch_size * args.tta_fraction).is_integer():
-    parser.error("--tta-fraction times --eval-batch-size must be an integer")
   batches_per_epoch = X_train_norm.shape[0] // batch_size
   epoch_count = math.ceil(steps / batches_per_epoch)
-  whiten_bias_steps = math.ceil(0.2 * batches_per_epoch)
   wd = WEIGHT_DECAY * batch_size
-  opt_whiten = nn.optim.SGD(whiten_bias, lr=BIAS_LR, momentum=SGD_MOMENTUM, nesterov=True,
-                            weight_decay=wd/BIAS_LR, fused=False)
   opt_norm = nn.optim.SGD(norm_biases, lr=BIAS_LR, momentum=SGD_MOMENTUM, nesterov=True,
                           weight_decay=wd/BIAS_LR, fused=False)
   opt_head = nn.optim.SGD(head, lr=HEAD_LR, momentum=SGD_MOMENTUM, nesterov=True,
@@ -281,147 +312,74 @@ def main() -> None:
   opt_muon = AirbenchMuon(hidden_convs, lr=MUON_LR, momentum=MUON_MOMENTUM, weight_decay=wd, ns_steps=3)
   phase("optim_init")
 
-  mutable_tensors:list[Tensor] = []
-  for tensor in [*state.values(), opt_whiten.lr, *opt_whiten.b, opt_norm.lr, *opt_norm.b,
-                 opt_head.lr, *opt_head.b, opt_muon.lr, *opt_muon.b]:
-    if all(tensor is not existing for existing in mutable_tensors): mutable_tensors.append(tensor)
-  Tensor.realize(*mutable_tensors)
-  initial_values = [tensor.clone().realize() for tensor in mutable_tensors]
-  rng_values = {device: counter.clone().realize() for device, counter in Tensor._device_rng_counters.items()}
-  permutation_rng = np.random.default_rng(args.seed)
-  permutation_coefficients = []
-  for _ in range(epoch_count):
-    coefficients = np.empty((4, 4), dtype=np.int32)
-    coefficients[:, :2] = permutation_rng.integers(0, batches_per_epoch, size=(4, 2), dtype=np.int32)
-    coefficients[:, 2:] = permutation_rng.integers(0, batch_size, size=(4, 2), dtype=np.int32)
-    permutation_coefficients.append(Tensor(coefficients, dtype=dtypes.int32).realize())
+  Tensor.realize(*state.values(), opt_norm.lr, *opt_norm.b, opt_head.lr, *opt_head.b, opt_muon.lr, *opt_muon.b)
+  permutation_coefficients = permutation_parameters(args.seed, epoch_count, batches_per_epoch, batch_size)
 
-  def set_lrs(step:int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    whiten_lr = BIAS_LR * max(0.0, 1.0 - step / whiten_bias_steps)
+  def set_lrs(step:int) -> tuple[float, float, float]:
     train_scale = max(0.0, 1.0 - step / steps)
     norm_lr = BIAS_LR * train_scale
-    return Tensor([whiten_lr], dtype=dtypes.float32), Tensor([norm_lr], dtype=dtypes.float32), \
-           Tensor([HEAD_LR * train_scale], dtype=dtypes.float32), Tensor([MUON_LR * train_scale], dtype=dtypes.float32)
+    return norm_lr, HEAD_LR * train_scale, MUON_LR * train_scale
 
-  learning_rates = [set_lrs(step) for step in range(steps)]
-  Tensor.realize(*[lr for step_lrs in learning_rates for lr in step_lrs])
+  learning_rates = Tensor([set_lrs(step) for step in range(steps)], dtype=dtypes.float32).realize()
+  train_step_number = Variable("train_step", 0, steps - 1)
 
   def zero_grads(*opts) -> None:
     for opt in opts: opt.zero_grad()
 
-  def sgd_realize(lr_whiten:Tensor, lr_norm:Tensor, lr_head:Tensor) -> list[Tensor]:
-    return [opt_whiten.lr.assign(lr_whiten), opt_norm.lr.assign(lr_norm), opt_head.lr.assign(lr_head),
-            *opt_whiten.schedule_step(), *opt_norm.schedule_step(), *opt_head.schedule_step()]
+  def sgd_realize(lr_norm:Tensor, lr_head:Tensor) -> list[Tensor]:
+    return [opt_norm.lr.assign(lr_norm), opt_head.lr.assign(lr_head), *opt_norm.schedule_step(), *opt_head.schedule_step()]
 
-  def muon_realize(lr_muon:Tensor, normalize_weights:bool) -> list[Tensor]:
+  def muon_realize(lr_muon:Tensor, normalize_weights:Tensor) -> list[Tensor]:
     opt_muon.normalize_weights = normalize_weights
     return [opt_muon.lr.assign(lr_muon), *opt_muon.schedule_step()]
 
-  def sgd_realize_no_whiten(lr_norm:Tensor, lr_head:Tensor) -> list[Tensor]:
-    return [opt_norm.lr.assign(lr_norm), opt_head.lr.assign(lr_head), *opt_norm.schedule_step(), *opt_head.schedule_step()]
-
-  def train_step_impl(X_epoch:Tensor, Y_epoch:Tensor, batch, lr_whiten:Tensor|None, lr_norm:Tensor,
-                      lr_head:Tensor, lr_muon:Tensor, whiten_bias_grad:bool, normalize_weights:bool) -> Tensor:
+  def train_step_impl(X_epoch:Tensor, Y_epoch:Tensor, batch, step) -> Tensor:
     start = batch * batch_size
     X, Y = X_epoch[start:start+batch_size], Y_epoch[start:start+batch_size]
-    zero_grads(opt_whiten, opt_norm, opt_head, opt_muon)
-    loss = cross_entropy_sum(model(X, whiten_bias_grad=whiten_bias_grad), Y, LABEL_SMOOTHING)
+    lr_norm, lr_head, lr_muon = [learning_rates[step, i:i+1] for i in range(3)]
+    normalize_weights = normalization_schedule[step]
+    zero_grads(opt_norm, opt_head, opt_muon)
+    loss = cross_entropy_sum(model(X), Y, LABEL_SMOOTHING)
     loss.backward()
-    sgd = sgd_realize(lr_whiten, lr_norm, lr_head) if lr_whiten is not None else sgd_realize_no_whiten(lr_norm, lr_head)
-    return loss.realize(*sgd, *muon_realize(lr_muon, normalize_weights), *bn_buffers)
+    return loss.realize(*sgd_realize(lr_norm, lr_head), *muon_realize(lr_muon, normalize_weights), *bn_buffers)
 
-  @TinyJit
   @Context(TRAINING=1)
-  def train_step_bias(X:Tensor, Y:Tensor, batch, lr_whiten:Tensor, lr_norm:Tensor, lr_head:Tensor, lr_muon:Tensor) -> Tensor:
-    return train_step_impl(X, Y, batch, lr_whiten, lr_norm, lr_head, lr_muon, True, False)
+  def train_step_fxn(X:Tensor, Y:Tensor, batch, step) -> Tensor:
+    return train_step_impl(X, Y, batch, step)
 
-  @TinyJit
-  @Context(TRAINING=1)
-  def train_step_bias_norm(X:Tensor, Y:Tensor, batch, lr_whiten:Tensor, lr_norm:Tensor, lr_head:Tensor, lr_muon:Tensor) -> Tensor:
-    return train_step_impl(X, Y, batch, lr_whiten, lr_norm, lr_head, lr_muon, True, True)
+  train_step = TinyJit(train_step_fxn, warmup=False)
 
-  @TinyJit
-  @Context(TRAINING=1)
-  def train_step(X:Tensor, Y:Tensor, batch, lr_norm:Tensor, lr_head:Tensor, lr_muon:Tensor) -> Tensor:
-    return train_step_impl(X, Y, batch, None, lr_norm, lr_head, lr_muon, False, False)
-
-  @TinyJit
-  @Context(TRAINING=1)
-  def train_step_norm(X:Tensor, Y:Tensor, batch, lr_norm:Tensor, lr_head:Tensor, lr_muon:Tensor) -> Tensor:
-    return train_step_impl(X, Y, batch, None, lr_norm, lr_head, lr_muon, False, True)
-
-  @TinyJit
   def prepare_epoch(Xsrc:Tensor, indices:Tensor) -> tuple[Tensor, Tensor]:
     X = random_crop_batch(Xsrc, indices)
     X = batch_color_jitter(X, BRIGHTNESS, CONTRAST)
     return activation_buffer(X).realize(), Y_train[indices].contiguous().realize()
 
-  @TinyJit
-  def prepare_permutation(coefficients:Tensor) -> Tensor:
-    return random_permutation(batches_per_epoch, batch_size, coefficients).realize()
+  def prepare_permutation(coefficients:Tensor, epoch) -> Tensor:
+    return random_permutation(batches_per_epoch, batch_size, coefficients[epoch]).realize()
+
+  prepare_epoch, prepare_permutation = TinyJit(prepare_epoch, warmup=False), TinyJit(prepare_permutation, warmup=False)
+  tta_base_weight = Tensor([args.tta_base_weight], dtype=dtypes.default_float).realize()
 
   def infer_mirror(X:Tensor) -> Tensor:
-    return (model(X, whiten_bias_grad=False) + model(X.flip(-1), whiten_bias_grad=False)) * 0.5
+    views = Tensor.cat(X, X.flip(-1), dim=0)
+    logits = model(views).reshape(2, X.shape[0], 10)
+    return logits[0] * tta_base_weight + logits[1] * (1.0 - tta_base_weight)
 
-  def infer_tta2(X:Tensor) -> Tensor:
-    Xp = pad_reflect(X, 1)
-    base_views = Tensor.cat(X, Xp[:, :, 0:32, 0:32], Xp[:, :, 2:34, 2:34], dim=0)
-    logits = model(Tensor.cat(base_views, base_views.flip(-1), dim=0), whiten_bias_grad=False).reshape(6, X.shape[0], 10)
-    base = (logits[0] + logits[3]) * 0.5
-    translated = (logits[1] + logits[2] + logits[4] + logits[5]) * 0.25
-    return base * TTA_BASE_WEIGHT + translated * (1.0 - TTA_BASE_WEIGHT)
-
-  @TinyJit
   @Context(TRAINING=0)
   def eval_step_basic(i) -> Tensor:
     X, Y = X_test[i:i+args.eval_batch_size], Y_test[i:i+args.eval_batch_size]
-    return (model(X, whiten_bias_grad=False).argmax(axis=1) == Y).sum().realize()
+    return (model(X).argmax(axis=1) == Y).sum().realize()
 
-  @TinyJit
   @Context(TRAINING=0)
   def eval_step_mirror(i) -> Tensor:
     X, Y = X_test[i:i+args.eval_batch_size], Y_test[i:i+args.eval_batch_size]
     return (infer_mirror(X).argmax(axis=1) == Y).sum().realize()
 
-  @TinyJit
-  @Context(TRAINING=0)
-  def eval_base_logits(i) -> Tensor:
-    return model(X_test[i:i+args.eval_batch_size], whiten_bias_grad=False).realize()
-
   eval_i = Variable("eval_i", 0, X_test.shape[0] - args.eval_batch_size)
-  selected_count = round(X_test.shape[0] * args.tta_fraction)
-  selected_batch_size = round(args.eval_batch_size * args.tta_fraction)
-  assert selected_count % selected_batch_size == 0
-  selected_i = Variable("selected_i", 0, selected_count - selected_batch_size)
-
-  @TinyJit
-  @Context(TRAINING=0)
-  def eval_select_global(*chunks:Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    logits = Tensor.cat(*chunks, dim=0)
-    uncertain = select_tta_indices(logits, selected_count)
-    base_correct = logits.argmax(axis=1) == Y_test
-    return uncertain.realize(), base_correct.sum().realize(), base_correct[uncertain].sum().realize()
-
-  @TinyJit
-  @Context(TRAINING=0)
-  def eval_selected_tta(indices:Tensor, i, correct:Tensor) -> Tensor:
-    batch_indices = indices[i:i+selected_batch_size]
-    X, Y = X_test[batch_indices], Y_test[batch_indices]
-    return correct.assign(correct + (infer_tta2(X).argmax(axis=1) == Y).sum()).realize()
-
-  @TinyJit
-  def eval_finalize(base_correct:Tensor, base_selected:Tensor, tta_correct:Tensor) -> Tensor:
-    return (base_correct - base_selected + tta_correct).realize()
+  eval_step_basic, eval_step_mirror = TinyJit(eval_step_basic, warmup=False), TinyJit(eval_step_mirror, warmup=False)
 
   def evaluate() -> Tensor:
     assert X_test.shape[0] % args.eval_batch_size == 0, "eval batch size must divide CIFAR-10 test size"
-    if args.tta_level == 2:
-      chunks = [eval_base_logits(eval_i.bind(i)).clone().realize() for i in range(0, X_test.shape[0], args.eval_batch_size)]
-      uncertain, base_correct, base_selected = eval_select_global(*chunks)
-      selected_correct = Tensor.zeros((), dtype=dtypes.int32).clone().realize()
-      for i in range(0, selected_count, selected_batch_size):
-        eval_selected_tta(uncertain, selected_i.bind(i), selected_correct)
-      return eval_finalize(base_correct, base_selected, selected_correct)
     eval_fn = (eval_step_basic, eval_step_mirror)[args.tta_level]
     correct = Tensor.zeros((), dtype=dtypes.int32).realize()
     for i in range(0, X_test.shape[0], args.eval_batch_size):
@@ -435,39 +393,11 @@ def main() -> None:
     if current_step - last_norm_step >= norm_frequency:
       norm_steps.add(current_step)
       last_norm_step = current_step
+  normalization_schedule = Tensor([
+    args.muon_normalization == "always" or (args.muon_normalization == "periodic" and step + 1 in norm_steps)
+    for step in range(steps)], dtype=dtypes.bool).realize()
   train_batch = Variable("train_batch", 0, batches_per_epoch - 1)
-
-  compile_warmup = 0.0
-  if not args.no_warmup:
-    Device[Device.DEFAULT].synchronize()
-    warmup_start = time.perf_counter()
-    for _ in range(2): warm_indices = prepare_permutation(permutation_coefficients[0])
-    for _ in range(2): X_warm, Y_warm = prepare_epoch(X_train_pad, warm_indices)
-    warm_batch = train_batch.bind(0)
-    warm_lrs = learning_rates[0]
-    for _ in range(2): train_step_bias(X_warm, Y_warm, warm_batch, *warm_lrs)
-    for _ in range(2): train_step_bias_norm(X_warm, Y_warm, warm_batch, *warm_lrs)
-    for _ in range(2): train_step(X_warm, Y_warm, warm_batch, *warm_lrs[1:])
-    for _ in range(2): train_step_norm(X_warm, Y_warm, warm_batch, *warm_lrs[1:])
-    whitening_images = X_train_norm[:960].contiguous().realize()
-    for _ in range(2): whitening_covariance(whitening_images)
-    if args.tta_level == 2:
-      warm_chunks = []
-      for i in range(0, X_test.shape[0], args.eval_batch_size):
-        warm_chunks.append(eval_base_logits(eval_i.bind(i)).clone().realize())
-      for _ in range(2): warm_selected, warm_base, warm_base_selected = eval_select_global(*warm_chunks)
-      warm_correct = Tensor.zeros((), dtype=dtypes.int32).clone().realize()
-      for _ in range(2): eval_selected_tta(warm_selected, selected_i.bind(0), warm_correct)
-      for _ in range(2): eval_finalize(warm_base, warm_base_selected, warm_correct)
-    else:
-      eval_fn = (eval_step_basic, eval_step_mirror)[args.tta_level]
-      for _ in range(2): eval_fn(eval_i.bind(0))
-    Device[Device.DEFAULT].synchronize()
-    compile_warmup = time.perf_counter() - warmup_start
-    Tensor.realize(*[tensor.assign(value) for tensor, value in zip(mutable_tensors, initial_values)])
-    Tensor.realize(*[Tensor._device_rng_counters[device].assign(value) for device, value in rng_values.items()])
-    Device[Device.DEFAULT].synchronize()
-    phase("compile_warmup_restore")
+  train_epoch = Variable("train_epoch", 0, epoch_count - 1)
 
   Device[Device.DEFAULT].synchronize()
   t0 = time.perf_counter()
@@ -483,30 +413,24 @@ def main() -> None:
       Device[Device.DEFAULT].synchronize()
       epoch_prepare_start = time.perf_counter()
     Xsrc = X_train_pad if epoch % 2 == 0 else X_train_pad_flip
-    indices = prepare_permutation(permutation_coefficients[epoch])
+    indices = prepare_permutation(permutation_coefficients, train_epoch.bind(epoch))
     X_epoch, Y_epoch = prepare_epoch(Xsrc, indices)
     if args.profile_phases:
       Device[Device.DEFAULT].synchronize()
       print(f"phase=epoch_prepare_{epoch} seconds={time.perf_counter()-epoch_prepare_start:.4f}", flush=True)
     for epoch_step in range(batches_per_epoch):
-      lr_whiten, lr_norm, lr_head, lr_muon = learning_rates[step]
       detail_profile = args.profile_phases and steps <= 10
       if detail_profile:
         Device[Device.DEFAULT].synchronize()
         detail_start = time.perf_counter()
       batch = train_batch.bind(epoch_step)
-      normalize_weights = step + 1 in norm_steps
-      if step < whiten_bias_steps:
-        train_fn = train_step_bias_norm if normalize_weights else train_step_bias
-        train_fn(X_epoch, Y_epoch, batch, lr_whiten, lr_norm, lr_head, lr_muon)
-      else:
-        train_fn = train_step_norm if normalize_weights else train_step
-        train_fn(X_epoch, Y_epoch, batch, lr_norm, lr_head, lr_muon)
+      step_var = train_step_number.bind(step)
+      train_step(X_epoch, Y_epoch, batch, step_var)
       if detail_profile:
         Device[Device.DEFAULT].synchronize()
         print(f"phase=train_graph_step_{step} seconds={time.perf_counter()-detail_start:.4f}", flush=True)
       step += 1
-      if args.profile_phases and step in {2, whiten_bias_steps, whiten_bias_steps + 2, steps}:
+      if args.profile_phases and step in {2, steps}:
         Device[Device.DEFAULT].synchronize()
         now = time.perf_counter()
         print(f"phase=train_steps_{segment_step}_{step} seconds={now-segment_start:.4f}", flush=True)
@@ -518,8 +442,7 @@ def main() -> None:
     print(f"phase=timed_train seconds={train_end-train_start:.4f}", flush=True)
   eval_start = time.perf_counter()
   correct = evaluate()
-  correct_count = int(correct.numpy().item())
-  Device[Device.DEFAULT].synchronize()
+  correct_count = int(correct.item())
   end_time = time.perf_counter()
   wall_time = end_time - t0
   total_time = end_time - total_start
@@ -528,6 +451,7 @@ def main() -> None:
 
   acc = correct_count / X_test.shape[0] * 100.0
   if not args.quiet:
+    import os, subprocess
     gpu_id = os.getenv("SLURM_JOB_GPUS", os.getenv("CUDA_VISIBLE_DEVICES", "")).split(",")[0]
     gpu_query = ["nvidia-smi", "--query-gpu=uuid,name,driver_version", "--format=csv,noheader"]
     if gpu_id: gpu_query += ["-i", gpu_id]
@@ -538,17 +462,18 @@ def main() -> None:
       dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], text=True).strip())
     except Exception: commit, dirty = "unknown", "unknown"
     print(f"hardware={gpu_info} tinygrad_commit={commit} git_dirty={dirty}")
-    print(f"runtime DEV={Device.DEFAULT} DEFAULT_FLOAT={dtypes.default_float} JITBEAM={getenv('JITBEAM', 0)}")
-  print(f"device={Device.DEFAULT} seed={args.seed} steps={steps} batch_size={batch_size} width={WIDTH} "
-        f"whiten_bias_steps={whiten_bias_steps} tta_level={args.tta_level} tta_base_weight={TTA_BASE_WEIGHT:.2f} "
-        f"tta_fraction={args.tta_fraction:.3f} tta_score=margin")
+  print(f"runtime DEV={Device.DEFAULT} DEFAULT_FLOAT={dtypes.default_float} JITBEAM={getenv('JITBEAM', 0)}")
+  print("jit first_call_capture=included train_graphs=1")
+  print(f"device={Device.DEFAULT} seed={args.seed} steps={steps} batch_size={batch_size} width={args.width} "
+        f"tta_level={args.tta_level} tta_base_weight={args.tta_base_weight:.3f}")
+  print(f"muon_normalization={args.muon_normalization} whitening_bias=analytic_frozen")
   print(f"optimizer bias_lr={BIAS_LR:.6f} head_lr={HEAD_LR:.6f} muon_lr={MUON_LR:.6f} "
         f"sgd_momentum={SGD_MOMENTUM:.4f} muon_momentum={MUON_MOMENTUM:.4f} weight_decay={wd:.8f}")
   print(f"loss label_smoothing={LABEL_SMOOTHING:.4f} loss_mult=1.0000 "
-        f"bn_eps={BN_EPS:.2g} bn_momentum={BN_MOMENTUM:.4f} logit_div={LOGIT_DIV:.4f}")
-  print("benchmark_region=whitening_train_eval_accuracy_readback compile_warmup=excluded")
+        f"bn_eps={BN_EPS:.2g} bn_momentum={BN_MOMENTUM:.4f} logit_div={model.logit_div:.4f}")
+  print("benchmark_region=whitening_train_eval_accuracy_readback first_call_jit_capture=included")
   print(f"accuracy={acc:.2f} correct={correct_count}/{X_test.shape[0]} benchmark_wall_time_s={wall_time:.4f} "
-        f"compile_warmup_s={compile_warmup:.4f} after_import_wall_time_s={total_time:.4f}")
+        f"after_import_wall_time_s={total_time:.4f}")
   if args.target_acc and acc < args.target_acc: raise SystemExit(f"accuracy {acc:.2f} < target {args.target_acc:.2f}")
   if args.target_time and wall_time >= args.target_time: raise SystemExit(f"benchmark wall time {wall_time:.4f} >= target {args.target_time:.4f}")
   if args.save_weights: nn.state.safe_save(nn.state.get_state_dict(model), args.save_weights)
