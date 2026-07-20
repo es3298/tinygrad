@@ -62,7 +62,9 @@ def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None]:
   ret = None
   try:
     st = time.perf_counter()
-    prg = to_program(x[1].copy().get_optimized_ast(name_override="test"), x[1].ren)
+    # Beam candidates are transient; level 2 retains the compiler cache without filling the persistent final-program cache.
+    with Context(CACHELEVEL=min(CACHELEVEL.value, 2)):
+      prg = to_program(x[1].copy().get_optimized_ast(name_override="test"), x[1].ren)
     et = time.perf_counter() - st
     uops = prg.src[1].src
     if len(uops) >= (uops_max:=getenv("BEAM_UOPS_MAX", 3000)) > 0:

@@ -31,6 +31,40 @@ class TestJit(unittest.TestCase):
     add.reset()
     _simple_test(add, N=20)
 
+  def test_capture_first_jit(self):
+    calls = 0
+    def add_fxn(a, b):
+      nonlocal calls
+      calls += 1
+      return (a+b).realize()
+    add = TinyJit(add_fxn, warmup=False)
+    a, b = Tensor.ones(4).contiguous().realize(), Tensor.ones(4).contiguous().realize()
+    np.testing.assert_equal(add(a, b).numpy(), np.full(4, 2))
+    self.assertEqual(calls, 1)
+    self.assertIsNotNone(add.captured)
+    np.testing.assert_equal(add(a, b).numpy(), np.full(4, 2))
+    self.assertEqual(calls, 1)
+    add.reset()
+    self.assertEqual(add.cnt, 1)
+    np.testing.assert_equal(add(a, b).numpy(), np.full(4, 2))
+    self.assertEqual(calls, 2)
+    self.assertIsNotNone(add.captured)
+
+  def test_capture_first_jit_after_disabled_call(self):
+    calls = 0
+    def add_fxn(a, b):
+      nonlocal calls
+      calls += 1
+      return (a+b).realize()
+    add = TinyJit(add_fxn, warmup=False)
+    a, b = Tensor.ones(4).contiguous().realize(), Tensor.ones(4).contiguous().realize()
+    with Context(JIT=0): np.testing.assert_equal(add(a, b).numpy(), np.full(4, 2))
+    self.assertEqual(add.cnt, 1)
+    self.assertIsNone(add.captured)
+    np.testing.assert_equal(add(a, b).numpy(), np.full(4, 2))
+    self.assertEqual(calls, 2)
+    self.assertIsNotNone(add.captured)
+
   def test_simple_jit_norealize(self):
     @TinyJit
     def add(a, b): return (a+b)

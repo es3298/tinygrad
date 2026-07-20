@@ -383,12 +383,17 @@ cache_dir: str = os.path.join(getenv("XDG_CACHE_HOME", os.path.expanduser("~/Lib
 CACHEDB: str = getenv("CACHEDB", os.path.abspath(os.path.join(cache_dir, "cache.db")))
 
 VERSION = 22
-_db_connection = None
+_db_connection, _db_connection_pid = None, None
 def db_connection():
-  global _db_connection
+  global _db_connection, _db_connection_pid
+  pid = os.getpid()
+  if _db_connection is not None and _db_connection_pid != pid:
+    with contextlib.suppress(sqlite3.Error): _db_connection.close()
+    _db_connection = None
   if _db_connection is None:
     os.makedirs(CACHEDB.rsplit(os.sep, 1)[0], exist_ok=True)
     _db_connection = sqlite3.connect(CACHEDB, timeout=60, isolation_level="IMMEDIATE")
+    _db_connection_pid = pid
     # another connection has set it already or is in the process of setting it
     # that connection will lock the database
     with contextlib.suppress(sqlite3.OperationalError): _db_connection.execute("PRAGMA journal_mode=WAL").fetchone()

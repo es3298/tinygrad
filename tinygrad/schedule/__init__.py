@@ -1,8 +1,10 @@
-import time, inspect
+import hashlib, inspect, pickle, time
 from collections import deque
 from tinygrad.uop.ops import UOp, Ops, UOpMetaClass, track_rewrites, graph_rewrite, gate_kernel_sink, KernelInfo
 from tinygrad.uop.spec import type_verify, spec_tensor
-from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, pluralize, SCACHE, BASEDIR, partition
+from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, pluralize, SCACHE, CACHELEVEL, CAPTURE_PROCESS_REPLAY, VIZ, BASEDIR, partition
+from tinygrad.helpers import SPLIT_REDUCEOP, MAX_KERNEL_BUFFERS, PCONTIG, FLOAT16, OPENPILOT_HACKS, ALLREDUCE_CAST, RING, ALL2ALL, TUPLE_ORDER, getenv
+from tinygrad.helpers import diskcache_get, diskcache_put
 
 # **** schedule linearizer
 
@@ -104,20 +106,60 @@ pm_resolve_linear_call = PatternMatcher([
    graph_rewrite(linear_call.src[0], pm_post_sched_cache, ctx=({}, linear_call.src[1:]), walk=True, name="params to buffers")),
 ])+pm_flatten_linear
 
-schedule_cache: dict[bytes, UOp] = {}
+schedule_cache: dict[tuple, UOp] = {}
+def _schedule_cache_config() -> tuple:
+  config = (SPLIT_REDUCEOP, MAX_KERNEL_BUFFERS, PCONTIG, FLOAT16, OPENPILOT_HACKS, ALLREDUCE_CAST, RING, ALL2ALL, TUPLE_ORDER)
+  return (*[x.value for x in config], getenv("REDUCEOP_SPLIT_THRESHOLD", 32768), getenv("REDUCEOP_SPLIT_SIZE", 22),
+          getenv("RING_ALLREDUCE_THRESHOLD", 256_000), getenv("LATE_ALLREDUCE", 1))
+
+def _schedule_cache_key(function:UOp, structural_key:bytes|None) -> tuple:
+  return (structural_key if structural_key is not None else function), *_schedule_cache_config()
+
+def _disk_schedule_get(disk_key:str) -> UOp|None:
+  try: linear = diskcache_get("schedule", disk_key)
+  except Exception as e:
+    if DEBUG >= 1: print(f"schedule disk cache read failed: {e}")
+    return None
+  if linear is not None:
+    from tinygrad.codegen import _disk_cache_uop_safe
+    if not isinstance(linear, UOp) or linear.op is not Ops.LINEAR or not _disk_cache_uop_safe(linear):
+      if DEBUG >= 1: print("schedule disk cache ignored: invalid payload")
+      return None
+  return linear
+
+def _disk_schedule_put(disk_key:str, linear:UOp) -> None:
+  from tinygrad.codegen import _disk_cache_uop_safe
+  if not _disk_cache_uop_safe(linear):
+    if DEBUG >= 1: print("schedule disk cache skipped: runtime state in payload")
+    return
+  try: diskcache_put("schedule", disk_key, linear)
+  except Exception as e:
+    if DEBUG >= 1: print(f"schedule disk cache write failed: {e}")
+
 # ctx is just for DEBUG on inner
 def lower_sink_to_linear(function:UOp) -> UOp|None:
   st = time.perf_counter()
   if isinstance(function.arg, KernelInfo): return None
-  cache_key = function.key
-  if not SCACHE or (sc_ret:=schedule_cache.get(cache_key, None)) is None:
+  from tinygrad.codegen import _cache_source_fingerprint, _disk_uop_fingerprint
+  structure_key = _disk_uop_fingerprint(function)
+  cache_key = _schedule_cache_key(function, structure_key)
+  disk_key = None
+  if SCACHE and CACHELEVEL >= 3 and not VIZ and structure_key is not None:
+    if (source_key:=_cache_source_fingerprint()) is not None:
+      disk_key = hashlib.sha256(pickle.dumps((source_key, structure_key, _schedule_cache_config()))).hexdigest()
+  cache_label = "CACHE MISS"
+  if SCACHE and (linear:=schedule_cache.get(cache_key, None)) is not None:
+    cache_label = " cache hit"
+  elif disk_key is not None and not CAPTURE_PROCESS_REPLAY and (linear:=_disk_schedule_get(disk_key)) is not None:
+    schedule_cache[cache_key] = linear
+    cache_label = "  disk hit"
+  else:
     if SPEC: type_verify(function, spec_tensor)
     # support recursive CALLs
     linear = create_schedule(get_kernel_graph(function))
-    if SCACHE: schedule_cache[cache_key] = linear
-  else:
-    # schedule cache hit
-    linear = sc_ret
+    if SCACHE:
+      schedule_cache[cache_key] = linear
+      if disk_key is not None: _disk_schedule_put(disk_key, linear)
   if (DEBUG >= 1 and len(linear.src) > 1) or DEBUG >= 3:
     for frm in inspect.stack():
       if frm.filename == "<string>": continue
@@ -126,7 +168,7 @@ def lower_sink_to_linear(function:UOp) -> UOp|None:
     else:
       frm = None
     print(f"scheduled {len(linear.src):5d} kernels in {(time.perf_counter()-st)*1000:8.2f} ms"+\
-          f" | {' cache hit' if SCACHE and sc_ret is not None else 'CACHE MISS'} {cache_key.hex()[:8]}"+\
+          f" | {cache_label} {function.key.hex()[:8]}"+\
           f" | {len(UOpMetaClass.ucache):7d} uops in cache"+("" if frm is None else f" | {frm.filename}:{frm.lineno}"))
   return linear
 

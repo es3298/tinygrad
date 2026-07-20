@@ -1,14 +1,18 @@
-from dataclasses import replace, dataclass
-import itertools, functools
+from dataclasses import replace, dataclass, fields, is_dataclass
+from enum import Enum
+import functools, hashlib, itertools, pathlib, pickle, sys
 from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC
-from tinygrad.helpers import ALLOW_TF32, TracingKey, Context, panic
+from tinygrad.helpers import ALLOW_TF32, CACHELEVEL, CAPTURE_PROCESS_REPLAY, TC_SELECT, TC_OPT, FLOAT16, TUPLE_ORDER
+from tinygrad.helpers import CPU_COUNT, IGNORE_BEAM_CACHE, TracingKey, Context, panic, diskcache_get, diskcache_put, getenv
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, pm_lower_index_dtype, Ops, UPat, track_rewrites, KernelInfo, ProgramInfo, GroupOp
+from tinygrad.uop.ops import CallInfo
+from tinygrad.uop.ops import buffers
 from tinygrad.uop.ops import AxisType
 from tinygrad.uop.render import pyrender
 from tinygrad.uop.spec import type_verify, spec_tensor, spec_program
 from tinygrad.renderer import Renderer, Estimates
 from tinygrad.renderer.isa import ISARenderer, IselContext, PreRegAllocContext
-from tinygrad.dtype import dtypes, AddrSpace
+from tinygrad.dtype import dtypes, AddrSpace, Invalid
 
 # import all pattern matchers here
 from tinygrad.codegen.gpudims import pm_add_gpudims
@@ -425,13 +429,15 @@ def do_compile(ctx:Renderer, prg:UOp, source:UOp) -> UOp|None:
   if DEBUG >= 7: ctx.compiler.disassemble(lib)
   return prg.replace(src=prg.src + (UOp(Ops.BINARY, arg=lib),))
 
+pm_compile_program = PatternMatcher([
+  (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR), UPat(Ops.SOURCE, name="source")), name="prg"), do_compile),
+])
 pm_to_program = PatternMatcher([
   (UPat(Ops.PROGRAM, src=(UPat(Ops.SINK, name="sink"),), name="prg"), do_linearize),
   (UPat(Ops.PROGRAM, src=(UPat(Ops.SINK, name="sink"), UPat(Ops.LINEAR, name="lin")), name="prg"), do_estimates),
   (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR, src=UPat(Ops.INS), name="lin")), name="prg"), do_assemble),
   (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR, name="lin")), name="prg"), do_render),
-  (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR), UPat(Ops.SOURCE, name="source")), name="prg"), do_compile),
-])
+])+pm_compile_program
 
 @track_rewrites(name=lambda ast,renderer,ret,**kwargs: TracingKey(ret.src[0].arg.name,(ret.src[0].arg.function_name, ast), ret=renderer), replay=True)
 @Context(ALLOW_DEVICE_USAGE=0)
@@ -463,8 +469,107 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
   return prg
 
 to_program_cache: dict[tuple, UOp] = {}
+@functools.cache
+def _cache_source_fingerprint() -> bytes|None:
+  try:
+    root, digest = pathlib.Path(__file__).parents[1], hashlib.sha256()
+    for path in sorted(root.rglob("*.py")):
+      digest.update(path.relative_to(root).as_posix().encode()+b"\0")
+      digest.update(path.read_bytes())
+    return digest.digest()
+  except OSError as e:
+    if DEBUG >= 1: print(f"persistent cache source fingerprint failed: {e}")
+    return None
+
+def _disk_cache_arg_safe(x, nodes:set[UOp]) -> bool:
+  if x is None or x is Invalid or isinstance(x, (bool, int, float, str, bytes, Enum)): return True
+  if isinstance(x, UOp): return x in nodes
+  if isinstance(x, CallInfo):
+    return x.grad_fxn is None and _disk_cache_arg_safe((x.name, x.precompile, x.precompile_backward, x.aux), nodes)
+  if isinstance(x, (tuple, list, set, frozenset)):
+    return all(_disk_cache_arg_safe(v, nodes) for v in x)
+  if isinstance(x, dict):
+    return all(_disk_cache_arg_safe(k, nodes) and _disk_cache_arg_safe(v, nodes) for k,v in x.items())
+  if is_dataclass(x) and type(x).__module__.startswith("tinygrad."):
+    return all(_disk_cache_arg_safe(getattr(x, f.name), nodes) for f in fields(x))
+  return False
+
+def _disk_cache_uop_safe(root:UOp, nodes:set[UOp]|None=None) -> bool:
+  if nodes is None: nodes = set(root.toposort())
+  if any(u in buffers or u.op in {Ops.CUSTOM_FUNCTION, Ops.FUNCTION} for u in nodes): return False
+  return all(_disk_cache_arg_safe((u.arg, u.tag, u.metadata), nodes) for u in nodes)
+
+def _disk_uop_fingerprint(root:UOp) -> bytes|None:
+  ordered_nodes = tuple(root.toposort())
+  nodes = set(ordered_nodes)
+  if not _disk_cache_uop_safe(root, nodes): return None
+  try:
+    extras = tuple((i, u.tag, (u.arg.name, u.arg.precompile, u.arg.precompile_backward, u.arg.aux)
+                    if isinstance(u.arg, CallInfo) else None) for i,u in enumerate(ordered_nodes) if u.tag is not None or isinstance(u.arg, CallInfo))
+    return hashlib.sha256(root.key+pickle.dumps(extras)).digest()
+  except (AttributeError, pickle.PickleError, TypeError):
+    return None
+
+def _program_cache_key(ast:UOp, renderer:Renderer, structural_key:bytes|None) -> tuple:
+  config = (NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC, IMAGE, DISABLE_FAST_IDIV, TRANSCENDENTAL, ALLOW_TF32,
+            TC_SELECT, TC_OPT, FLOAT16, TUPLE_ORDER, IGNORE_BEAM_CACHE)
+  env = (getenv("DMC", 0), getenv("ALLOW_HALF8", 0), getenv("EXPAND_SSA", 0), getenv("ALIGNED", 1), getenv("THREADS", 1),
+         getenv("BEAM_ESTIMATE", 1), getenv("BEAM_PADTO", 0), getenv("BEAM_TIMEOUT_SEC", 10), getenv("BEAM_UOPS_MAX", 3000),
+         getenv("BEAM_UPCAST_MAX", 256), getenv("BEAM_LOCAL_MAX", 1024), getenv("BEAM_MIN_PROGRESS", 0.01), getenv("BEAM_DEV_TIMEOUT", 1),
+         getenv("MV", 1), getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 8), getenv("MV_ROWS_PER_THREAD", 4),
+         getenv("OCCUPANCY_FLOOR", 4096), getenv("CC", "clang"), getenv("LLVMOPT", "1"), getenv("CUDA_PATH", ""),
+         getenv("ROCM_PATH", "/opt/rocm"))
+  renderer_config = (type(renderer), renderer.target, renderer.supports_float4, renderer.has_local, renderer.has_threads, renderer.has_shared,
+                     renderer.has_aux, renderer.global_max, renderer.local_max, renderer.global_prod_max, renderer.shared_max,
+                     tuple(renderer.tensor_cores), type(renderer.compiler), getattr(renderer.compiler, "cachekey", None))
+  return (structural_key if structural_key is not None else ast, renderer_config,
+          *[x.value for x in config], CPU_COUNT.value, sys.platform, sys.version_info[:3], *env)
+
+def _disk_program_payload_safe(prg:UOp) -> bool:
+  nodes = set(prg.toposort())
+  return prg.op is Ops.PROGRAM and len(prg.src) == 3 and prg.src[1].op is Ops.LINEAR and prg.src[2].op is Ops.SOURCE and \
+    not any(u.op in {Ops.INS, Ops.BINARY} for u in nodes) and _disk_cache_uop_safe(prg, nodes)
+
+def _disk_program_get(key:str) -> UOp|None:
+  try: prg = diskcache_get("program", key)
+  except Exception as e:
+    if DEBUG >= 1: print(f"program disk cache read failed: {e}")
+    return None
+  if prg is not None and (not isinstance(prg, UOp) or not _disk_program_payload_safe(prg)):
+    if DEBUG >= 1: print("program disk cache ignored: invalid payload")
+    return None
+  return prg
+
+def _compact_disk_program(prg:UOp) -> UOp:
+  # Runtime execution only needs ProgramInfo, generated source, and the compiled binary added on load.
+  sink = UOp(Ops.SINK, src=prg.arg.vars, arg=KernelInfo(name=prg.arg.name))
+  return prg.replace(src=(sink, UOp(Ops.LINEAR), prg.src[2]))
+
+def _disk_program_put(key:str, prg:UOp) -> None:
+  prg = _compact_disk_program(prg)
+  if not _disk_program_payload_safe(prg):
+    if DEBUG >= 1: print("program disk cache skipped: runtime state in payload")
+    return
+  try: diskcache_put("program", key, prg)
+  except Exception as e:
+    if DEBUG >= 1: print(f"program disk cache write failed: {e}")
+
 def to_program(ast:UOp, renderer:Renderer) -> UOp:
-  config = (NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC, IMAGE, DISABLE_FAST_IDIV, TRANSCENDENTAL, ALLOW_TF32)
-  key = (ast.key, type(renderer), renderer.target, *[x.value for x in config])
-  if (prg:=to_program_cache.get(key)) is None: to_program_cache[key] = prg = do_to_program(ast, renderer)
+  persist = CACHELEVEL >= 3
+  structural_key = _disk_uop_fingerprint(ast) if persist else None
+  key = _program_cache_key(ast, renderer, structural_key)
+  if (prg:=to_program_cache.get(key)) is not None: return prg
+  disk_key = None
+  if persist and not VIZ and type(renderer).__module__.startswith("tinygrad.") and \
+     (source_key:=_cache_source_fingerprint()) is not None and structural_key is not None:
+    disk_key = hashlib.sha256(pickle.dumps((source_key, structural_key, key))).hexdigest()
+  if disk_key is not None and not CAPTURE_PROCESS_REPLAY:
+    prg = _disk_program_get(disk_key)
+    if prg is not None: prg = graph_rewrite(prg, pm_compile_program, ctx=renderer, name="compile cached program")
+  if prg is None:
+    prg = do_to_program(ast, renderer)
+    if disk_key is not None:
+      assert prg.src[-1].op is Ops.BINARY
+      _disk_program_put(disk_key, prg.replace(src=prg.src[:-1]))
+  to_program_cache[key] = prg
   return prg
