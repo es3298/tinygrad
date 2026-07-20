@@ -163,5 +163,10 @@ assert helpers.diskcache_get('fork_test', 'child') == 1
     self.assertEqual(compact.src[2].arg, "source")
     self.assertTrue(_disk_program_payload_safe(compact))
 
+  def test_partial_uop_cleanup(self):
+    # Pickle can discard a UOp before __init__ has populated its fields.
+    partial = object.__new__(UOp)
+    partial.__del__()
+
 if __name__ == "__main__":
   unittest.main()
