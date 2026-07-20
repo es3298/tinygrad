@@ -156,7 +156,9 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
           if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too much compute. {this_compute_ops} when least is {least_compute_ops}")
           continue
         seen_libs.add(lib)
-        try: tms = _time_program(prg, var_vals, rawbufs, early_stop=beam[0][1]*3 if len(beam) else 1.0,
+        # The initial beam has no measured runtime. Keep a finite timeout so a bad first-generation kernel cannot hang the search.
+        early_stop = beam[0][1]*3 if len(beam) and math.isfinite(beam[0][1]) else 1.0
+        try: tms = _time_program(prg, var_vals, rawbufs, early_stop=early_stop,
                                  allow_test_size=allow_test_size, clear_l2=hasattr(dev, 'invalidate_caches'),
                                  dev_timeout=getenv("BEAM_DEV_TIMEOUT", 1))
         except Exception as e:
